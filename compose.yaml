@@ -1,0 +1,59 @@
+name: proxy-service
+
+services:
+  wmsxwd:
+    platform: linux/amd64
+    build:
+      context: .
+    restart: unless-stopped
+    user: "10000:10000"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=512m
+    shm_size: 512m
+    volumes:
+      - wmsxwd_home:/home/app
+    environment:
+      WMSXWD_GUI_PORT: ${WMSXWD_GUI_PORT:?not set - copy .env.example to .env}
+      WMSXWD_PROXY_PORT: ${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}
+      WMSXWD_AUTO_CONNECT: ${WMSXWD_AUTO_CONNECT:?not set - copy .env.example to .env}
+    secrets:
+      - vnc_password
+    ports:
+      - "127.0.0.1:${WMSXWD_GUI_PORT:?not set - copy .env.example to .env}:${WMSXWD_GUI_PORT:?not set - copy .env.example to .env}"
+      - "127.0.0.1:${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}:${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}"
+    networks:
+      - order_process
+    pids_limit: 512
+    mem_limit: 2g
+    cpus: 2
+    # Probed through the container's own alias, not 127.0.0.1: that is the
+    # path peers use, so it also catches the app binding loopback only (LAN
+    # access off), which a loopback probe reports as healthy. A live tunnel is
+    # deliberately NOT probed -- a dead upstream node must not restart-loop
+    # the container. Use `make status` for that.
+    healthcheck:
+      test:
+        - CMD-SHELL
+        - >-
+          bash -ec 'exec 3<>/dev/tcp/wmsxwd/${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}; exec 3>&-'
+      interval: 15s
+      timeout: 3s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  wmsxwd_home:
+
+secrets:
+  vnc_password:
+    file: ${VNC_PASSWORD_FILE:?not set - copy .env.example to .env}
+
+networks:
+  order_process:
+    external: true
+    name: order_process

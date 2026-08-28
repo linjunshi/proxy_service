@@ -1,0 +1,33 @@
+#!/bin/sh
+# Clean-slate restart of the GUI application. The app must never start while
+# a stale core process still holds its ports (mixed proxy, control API):
+# an instance that loses that port race enters a silent spawn-retry loop,
+# its status pill freezes on 未连接, and the start button stops doing
+# anything. Stopping the app and every core together guarantees the fresh
+# instance wins its own ports and restores the saved tunnel state cleanly.
+#
+# Usage: recover-app             restart the app, then re-run auto-connect
+#        recover-app --app-only  restart the app only (used by auto-connect)
+set -eu
+
+ctl() { supervisorctl -c /etc/supervisor/conf.d/wmsxwd.conf "$@"; }
+
+# Tolerate "not running": the goal is only that no app instance survives.
+ctl stop wmsxwd >/dev/null || true
+
+# The app's SIGTERM handler usually kills its own core, but crashed or
+# churn-phase instances leave orphans. -x matches the process name only;
+# -f would match this script's own command line.
+pkill -x AtlasCore_amd64 2>/dev/null || true
+sleep 2
+pkill -9 -x AtlasCore_amd64 2>/dev/null || true
+
+ctl start wmsxwd >/dev/null
+echo "recover-app: application restarted with a clean core slate"
+
+if [ "${1:-}" != "--app-only" ]; then
+    # The watchdog is already running; restarting it forces an immediate
+    # re-check instead of waiting out its interval.
+    ctl restart auto-connect >/dev/null
+    echo "recover-app: watchdog re-checking now; follow 'make logs' and check 'make status' in ~1-3 minutes"
+fi

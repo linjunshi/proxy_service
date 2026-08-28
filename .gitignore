@@ -1,0 +1,8 @@
+.env
+.DS_Store
+.idea/
+state/
+secrets/*
+!secrets/README.md
+vendor/*
+!vendor/README.md

@@ -1,0 +1,65 @@
+#!/bin/sh
+set -eu
+
+umask 077
+
+secret_path="${VNC_PASSWORD_FILE:-/run/secrets/vnc_password}"
+runtime_dir="${XDG_RUNTIME_DIR:-/tmp/runtime}"
+vnc_dir=/tmp/wmsxwd
+vnc_password_file="${vnc_dir}/vnc.pass"
+
+# Absent is never "empty". A mistyped VNC_PASSWORD_FILE must die here rather
+# than reach the empty branch below and unauthenticate the desktop.
+if [ ! -r "${secret_path}" ]; then
+    echo "VNC password secret is missing: ${secret_path}" >&2
+    exit 1
+fi
+
+vnc_password=$(tr -d '\r\n' < "${secret_path}")
+
+mkdir -p "${runtime_dir}" "${vnc_dir}"
+chmod 0700 "${runtime_dir}" "${vnc_dir}"
+
+# The secret file is the only switch: content means VNC auth, no content means
+# none. Whitespace counts as no content, since clearing a file in an editor
+# leaves blanks behind. Everything else must satisfy the classic-VNC
+# eight-character rule, so a malformed password fails the boot instead of
+# degrading to an open display.
+if [ -z "$(printf '%s' "${vnc_password}" | tr -d '[:space:]')" ]; then
+    VNC_SECURITY_ARGS="-SecurityTypes None"
+    echo "VNC password file is empty (${secret_path}): the desktop accepts any connection to the GUI port without authentication." >&2
+else
+    password_length=$(printf '%s' "${vnc_password}" | wc -c | tr -d ' ')
+
+    if [ "${password_length}" -ne 8 ]; then
+        echo "The VNC password must contain exactly 8 ASCII characters." >&2
+        exit 1
+    fi
+
+    if ! printf '%s' "${vnc_password}" | LC_ALL=C grep -Eq '^[!-~]{8}$'; then
+        echo "The VNC password must use printable ASCII characters only." >&2
+        exit 1
+    fi
+
+    printf '%s\n' "${vnc_password}" | tigervncpasswd -f > "${vnc_password_file}"
+    chmod 0600 "${vnc_password_file}"
+    VNC_SECURITY_ARGS="-SecurityTypes VncAuth -PasswordFile ${vnc_password_file}"
+fi
+
+unset vnc_password
+export VNC_SECURITY_ARGS
+
+# supervisord is the sole launcher. The application's "Launch at Startup"
+# toggle writes an XDG autostart entry, and Xfce would race a second
+# instance against the supervised one.
+rm -f /home/app/.config/autostart/*.desktop
+
+# The application writes ~6 MB of encrypted logs per day and never prunes
+# them; cap the volume growth here since it cannot be configured in-app.
+find /home/app/.local/share/wmsxwd/logs \
+     /home/app/.local/share/wmsxwd/crashes \
+     -type f -mtime +14 -delete 2>/dev/null || true
+
+exec dbus-run-session -- \
+    /usr/bin/supervisord \
+    --configuration /etc/supervisor/conf.d/wmsxwd.conf
