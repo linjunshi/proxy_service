@@ -28,14 +28,11 @@ services:
       - "127.0.0.1:${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}:${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}"
     networks:
       - order_process
-    pids_limit: 512
-    mem_limit: 2g
-    cpus: 2
-    # Probed through the container's own alias, not 127.0.0.1: that is the
-    # path peers use, so it also catches the app binding loopback only (LAN
-    # access off), which a loopback probe reports as healthy. A live tunnel is
-    # deliberately NOT probed -- a dead upstream node must not restart-loop
-    # the container. Use `make status` for that.
+    # Probed through the container's own service name (wmsxwd), not
+    # 127.0.0.1: that is the path peers use, so it also catches the app
+    # binding loopback only (LAN access off), which a loopback probe reports
+    # as healthy. A live tunnel is deliberately NOT probed -- a dead upstream
+    # node must not restart-loop the container. Use `make status` for that.
     healthcheck:
       test:
         - CMD-SHELL
