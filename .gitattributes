@@ -1,3 +1,5 @@
-# Files consumed by Linux must stay LF in Windows worktrees.
-container/* text eol=lf
-*.sh text eol=lf
+# Files consumed by Linux containers must stay LF in Windows worktrees.
+*.py text eol=lf
+*.yaml text eol=lf
+Makefile text eol=lf
+.env.example text eol=lf

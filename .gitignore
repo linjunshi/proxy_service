@@ -2,7 +2,12 @@
 .DS_Store
 .idea/
 state/
-secrets/*
-!secrets/README.md
 vendor/*
 !vendor/README.md
+implementation_plan.md
+__pycache__/
+
+# Local probes: they take the account credentials and are scratch tools, not
+# deliverables. CONTEXT.md carries the procedure itself, in curl.
+panel_probe.py
+sub_format_probe.py

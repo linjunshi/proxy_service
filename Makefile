@@ -1,13 +1,14 @@
-# Every setting comes from .env, the single source. It is created from the
-# template on first use, so no flow depends on remembering to copy it, and no
-# default is mirrored here where it could drift from what the stack runs on.
+# Every setting comes from .env, the single source. It is created from the template
+# on first use, so no flow depends on remembering to copy it, and no default is
+# mirrored here where it could drift from what the stack runs on.
 .env:
 	cp .env.example $@
 
 include .env
 
-.PHONY: build up down deploy restart recover logs status
+.PHONY: build up down deploy refresh logs status nodes
 
+# The refresher's unit tests run inside the build; a failing test fails the build.
 build:
 	docker compose build
 
@@ -22,39 +23,36 @@ deploy:
 	$(MAKE) build
 	$(MAKE) up
 
-# Restarting the GUI container re-runs auto-connect.
-restart:
-	docker compose restart wmsxwd
-
-# Clean-slate restart of the app inside the running container, then re-verify.
-# Use when the GUI is stuck (未连接 pill / dead start button) or the tunnel is
-# down. Follow with `make logs`; expect a verdict within ~1-3 minutes.
-recover:
-	docker compose exec wmsxwd recover-app
+# Restarting the sidecar runs a refresh cycle immediately.
+refresh:
+	docker compose restart refresher
 
 logs:
-	docker compose logs -f --tail 100 wmsxwd
+	docker compose logs -f --tail 100
 
-# Tunnel verdict: traffic is tunneled only when the two exit IPs differ.
+# Four questions, four answers: are the containers up, how many nodes and how fresh,
+# which node is selected, and does traffic actually leave through it.
 status:
-	docker compose ps
-	@proxied=$$(curl -s -m 12 --proxy http://127.0.0.1:$(WMSXWD_PROXY_PORT) http://api.ipify.org); \
-	direct=$$(curl -s -m 12 http://api.ipify.org); \
-	echo "exit via $(WMSXWD_PROXY_PORT): $${proxied:-unreachable}"; \
-	echo "exit direct:    $${direct:-unreachable}"; \
-	if [ -n "$$proxied" ] && [ -n "$$direct" ] && [ "$$proxied" != "$$direct" ]; then \
-		echo "tunnel: UP"; \
+	@docker compose ps
+	@line=$$(docker compose exec -T refresher python -c 'import os, time, yaml; p = "/providers/nodes.yaml"; n = yaml.safe_load(open(p))["proxies"]; print("nodes:     %d, published %.0f min ago" % (len(n), (time.time() - os.path.getmtime(p)) / 60))' 2>/dev/null); \
+	echo "$${line:-nodes:     unreadable - is the refresher up? (make logs)}"
+	@now=$$(docker compose exec -T proxy_service wget -q -O- --header 'Authorization: Bearer $(MIHOMO_API_SECRET)' http://127.0.0.1:9090/proxies/PROXY 2>/dev/null \
+		| sed -n 's/.*"now":"\([^"]*\)".*/\1/p'); \
+	echo "selected:  $${now:-unreadable - is the core up? (make logs)}"
+# --noproxy on the direct probe: a shell with HTTPS_PROXY exported would otherwise
+# measure the tunnel twice and call a real leak healthy.
+	@probe=$$(curl -s -m 15 --proxy http://127.0.0.1:$(PROXY_PORT) -w '\n%{time_total}s' https://api.ipify.org); \
+	proxied=$$(echo "$$probe" | head -1); elapsed=$$(echo "$$probe" | tail -1); \
+	direct=$$(curl -s -m 15 --noproxy '*' https://api.ipify.org); \
+	echo "exit:      $${proxied:-refused} through the proxy$${proxied:+ in $$elapsed}, $${direct:-unreachable} direct"; \
+	if [ -n "$$proxied" ] && [ "$$proxied" != "$$direct" ]; then \
+		echo "verdict:   UP - HTTPS leaves through the tunnel"; \
 	elif [ -n "$$proxied" ]; then \
-		echo "tunnel: NOT tunneled (serving direct rules)"; \
+		echo "verdict:   LEAKING - the proxy answers from this host's own address"; \
 	else \
-		echo "tunnel: proxy unreachable for foreign targets"; \
+		echo "verdict:   DOWN - the proxy refused, which is the intended failure"; \
 	fi
-# Plain HTTP proxying can work while CONNECT fails, and CONNECT is what every
-# HTTPS consumer uses -- so it gets its own verdict.
-	@code=$$(curl -s -m 15 -o /dev/null -w '%{http_code}' \
-		--proxy http://127.0.0.1:$(WMSXWD_PROXY_PORT) https://api.ipify.org); \
-	if [ "$$code" = "200" ]; then \
-		echo "https (CONNECT): OK"; \
-	else \
-		echo "https (CONNECT): FAILED - consumers using HTTPS will see EOF"; \
-	fi
+
+# The node names currently published, for checking a region filter.
+nodes:
+	@docker compose exec -T refresher python -c 'import yaml; print("\n".join(p["name"] for p in yaml.safe_load(open("/providers/nodes.yaml"))["proxies"]))'

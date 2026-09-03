@@ -1,0 +1,60 @@
+# The headless core. This file is the whole of the proxy's behaviour: the node list
+# beside it (providers/nodes.yaml) is written by the refresher and hot-reloaded.
+mixed-port: 1082
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+
+# Loopback only, so the control API is reachable from `docker compose exec` and from
+# nothing else. The secret (-secret, from MIHOMO_API_SECRET) is defence in depth, not
+# the boundary.
+external-controller: 127.0.0.1:9090
+
+profile:
+  # Never remember a manually selected node across restarts: the group's own health
+  # check is the only thing that should decide which node is live.
+  store-selected: false
+
+# No local resolver. Without TUN there is nothing to hijack, the mixed port receives
+# hostnames and hands them to the selected node, and a resolver we do not need is one
+# more thing that can answer wrongly.
+dns:
+  enable: false
+
+proxy-providers:
+  subscription:
+    type: file
+    path: ./providers/nodes.yaml
+    health-check:
+      enable: true
+      # A Google endpoint on purpose: the one consumer talks to Google, so a node that
+      # cannot reach it is useless to us however fast it answers something else.
+      url: https://www.gstatic.com/generate_204
+      interval: 60
+      # Test even while idle: the first request after a quiet hour must not be the
+      # thing that discovers the node died.
+      lazy: false
+
+proxy-groups:
+  - name: PROXY
+    type: url-test
+    use: [subscription]
+    url: https://www.gstatic.com/generate_204
+    interval: 60
+    tolerance: 50
+    lazy: false
+    # The most important line in this file. A group with no members falls back to
+    # COMPATIBLE, which is a DIRECT outbound: a missing, empty or unreadable node
+    # list would silently route every request out of the host's own address -- the
+    # exact failure that retired the previous stack. REJECT refuses instead, which
+    # also turns the container unhealthy rather than quietly serving the wrong exit.
+    empty-fallback: REJECT
+
+# No DIRECT anywhere: with the core up and every node dead, a request must fail rather
+# than leave from the host's own address, which is the whole reason this stack exists.
+rules:
+  - MATCH,PROXY
