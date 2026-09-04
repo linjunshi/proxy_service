@@ -6,7 +6,7 @@
 
 include .env
 
-.PHONY: build up down deploy refresh logs status nodes
+.PHONY: build up down deploy refresh rotate pin logs status nodes
 
 # The refresher's unit tests run inside the build; a failing test fails the build.
 build:
@@ -23,22 +23,35 @@ deploy:
 	$(MAKE) build
 	$(MAKE) up
 
-# Restarting the sidecar runs a refresh cycle immediately.
+# Restarting a sidecar runs its cycle immediately: refresh re-fetches the node list,
+# rotate leaves the country in play for the next one. `make rotate` is the answer to a
+# block you have actually observed -- a health check cannot see one.
 refresh:
 	docker compose restart refresher
+
+rotate:
+	docker compose restart rotator
+
+# Hold one country -- `make pin C=US` -- until `make up` puts the rotator back.
+pin:
+	@test -n "$(C)" || { echo "usage: make pin C=<JP|US|TW|KR|DE|IN>"; exit 2; }
+	docker compose stop rotator
+	docker compose run --rm rotator /app/rotate.py --pin $(C)
 
 logs:
 	docker compose logs -f --tail 100
 
-# Four questions, four answers: are the containers up, how many nodes and how fresh,
-# which node is selected, and does traffic actually leave through it.
+# Five questions, five answers: are the containers up, how many nodes and how fresh,
+# which country is in play and through which node, how much of each country is alive,
+# and does traffic actually leave through it.
 status:
 	@docker compose ps
 	@line=$$(docker compose exec -T refresher python -c 'import os, time, yaml; p = "/providers/nodes.yaml"; n = yaml.safe_load(open(p))["proxies"]; print("nodes:     %d, published %.0f min ago" % (len(n), (time.time() - os.path.getmtime(p)) / 60))' 2>/dev/null); \
 	echo "$${line:-nodes:     unreadable - is the refresher up? (make logs)}"
-	@now=$$(docker compose exec -T proxy_service wget -q -O- --header 'Authorization: Bearer $(MIHOMO_API_SECRET)' http://127.0.0.1:9090/proxies/PROXY 2>/dev/null \
-		| sed -n 's/.*"now":"\([^"]*\)".*/\1/p'); \
-	echo "selected:  $${now:-unreadable - is the core up? (make logs)}"
+# The rotator is the component that knows what a country is, so it answers for both
+# lines. A pinned deployment has it stopped, which is what the fallback says.
+	@report=$$(docker compose exec -T rotator python /app/rotate.py --status 2>/dev/null); \
+	echo "$${report:-country:   unreadable - is the rotator up, or pinned? (make logs)}"
 # --noproxy on the direct probe: a shell with HTTPS_PROXY exported would otherwise
 # measure the tunnel twice and call a real leak healthy.
 	@probe=$$(curl -s -m 15 --proxy http://127.0.0.1:$(PROXY_PORT) -w '\n%{time_total}s' https://api.ipify.org); \

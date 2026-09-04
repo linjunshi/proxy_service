@@ -1,3 +1,7 @@
+# One image, two sidecar programs: refresh.py keeps the node list fresh, rotate.py
+# moves the live country. They share this build because they share a base, a settings
+# reader and a test run -- compose.yaml picks which one a container is.
+#
 # Digest-pinned so the same bytes build the same image everywhere.
 ARG PYTHON_IMAGE=python:3.12-slim@sha256:78387bc3881b8273120a12ebe6c1ab22b018ccc2c9adf565ae1ac9b536e184ea
 ARG PYYAML_VERSION=6.0.2
@@ -24,10 +28,11 @@ RUN pip install --no-cache-dir "pyyaml==${PYYAML_VERSION}" \
 # is the only way this non-root process can write to it.
     && install -d -o refresher -g refresher /providers
 
-COPY --from=test /src/refresh.py /app/refresh.py
+COPY --from=test /src/env.py /src/refresh.py /src/rotate.py /app/
 
 ENV PYTHONDONTWRITEBYTECODE=1
 
 USER refresher
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["python", "-u", "/app/refresh.py"]
+ENTRYPOINT ["python", "-u"]
+CMD ["/app/refresh.py"]

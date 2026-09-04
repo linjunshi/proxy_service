@@ -12,6 +12,7 @@ The contract with the vendor's API, and how to re-derive it, is in CONTEXT.md.
 
 from __future__ import annotations
 
+import http.client
 import json
 import logging
 import os
@@ -25,6 +26,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+
+import env
 
 LOG = logging.getLogger("refresher")
 
@@ -73,15 +76,15 @@ class Settings:
     def from_env() -> Settings:
         """Read the whole configuration, or refuse to start naming what is missing."""
         return Settings(
-            panel_base_url=_required("PANEL_BASE_URL").rstrip("/"),
-            email=_required("PANEL_EMAIL"),
-            password=_required("PANEL_PASSWORD"),
-            region_filter=_pattern("PROXY_REGION_FILTER", DEFAULT_REGION_FILTER),
-            region_exclude=_optional_pattern("PROXY_REGION_EXCLUDE"),
-            min_nodes=_positive_int("PROXY_MIN_NODES", 1),
-            interval_seconds=_positive_int("REFRESH_INTERVAL_SECONDS", 1800),
-            retry_interval_seconds=_positive_int("RETRY_INTERVAL_SECONDS", 300),
-            nodes_path=Path(os.environ.get("NODES_PATH", "/providers/nodes.yaml")),
+            panel_base_url=env.required("PANEL_BASE_URL").rstrip("/"),
+            email=env.required("PANEL_EMAIL"),
+            password=env.required("PANEL_PASSWORD"),
+            region_filter=env.pattern("PROXY_REGION_FILTER", DEFAULT_REGION_FILTER),
+            region_exclude=env.optional_pattern("PROXY_REGION_EXCLUDE"),
+            min_nodes=env.whole_number("PROXY_MIN_NODES", 1),
+            interval_seconds=env.whole_number("REFRESH_INTERVAL_SECONDS", 1800),
+            retry_interval_seconds=env.whole_number("RETRY_INTERVAL_SECONDS", 300),
+            nodes_path=Path(env.optional("NODES_PATH", "/providers/nodes.yaml")),
         )
 
 
@@ -225,10 +228,14 @@ def _get(url: str, *, data: bytes | None = None, headers: dict[str, str] | None 
             return response.read()
     except urllib.error.HTTPError as error:
         raise RefreshError(f"{_public(url)} answered HTTP {error.code}") from error
-    except urllib.error.URLError as error:
-        raise RefreshError(f"{_public(url)} unreachable: {error.reason}") from error
     except TimeoutError as error:
         raise RefreshError(f"{_public(url)} timed out after {HTTP_TIMEOUT_SECONDS}s") from error
+    # URLError is an OSError, but urllib only converts what the *request* raises: a peer
+    # that closes the connection while the response is being read arrives here as a raw
+    # http.client error. Catching the whole family is what keeps a flaky panel a logged
+    # retry instead of a crash that restarts the container and re-logs in.
+    except (OSError, http.client.HTTPException) as error:
+        raise RefreshError(f"{_public(url)} unreachable: {getattr(error, 'reason', error) or type(error).__name__}") from error
 
 
 def _request_json(url: str, **kwargs) -> dict:
@@ -268,44 +275,7 @@ def _public(url: str) -> str:
     return urllib.parse.urlunsplit((parts.scheme, parts.netloc.rpartition("@")[2], parts.path, "", ""))
 
 
-# ---- settings and staleness --------------------------------------------------------
-
-
-def _required(name: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise ValueError(f"{name} is not set")
-    return value
-
-
-def _positive_int(name: str, default: int) -> int:
-    raw = os.environ.get(name, "").strip()
-    if not raw:
-        return default
-    try:
-        value = int(raw)
-    except ValueError:
-        raise ValueError(f"{name} must be a whole number, got {raw!r}") from None
-    if value < 1:
-        raise ValueError(f"{name} must be at least 1, got {value}")
-    return value
-
-
-def _pattern(name: str, default: str) -> re.Pattern[str]:
-    return _compile(name, os.environ.get(name, "").strip() or default)
-
-
-def _optional_pattern(name: str) -> re.Pattern[str] | None:
-    """An unset exclude means exclude nothing -- an empty pattern would match every name."""
-    raw = os.environ.get(name, "").strip()
-    return _compile(name, raw) if raw else None
-
-
-def _compile(name: str, pattern: str) -> re.Pattern[str]:
-    try:
-        return re.compile(pattern)
-    except re.error as error:
-        raise ValueError(f"{name} is not a valid regex: {error}") from None
+# ---- staleness ---------------------------------------------------------------------
 
 
 def _standing(path: Path) -> str:

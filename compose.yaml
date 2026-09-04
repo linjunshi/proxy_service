@@ -66,6 +66,41 @@ services:
       retries: 3
       start_period: 90s
 
+  # Moves the live country every PROXY_ROTATION_SECONDS, so no exit IP faces the
+  # consumer's upstream long enough to be worth blocking. Same image as the refresher,
+  # different program.
+  rotator:
+    build: ./refresher
+    command: ["/app/rotate.py"]
+    container_name: proxy_rotator
+    restart: unless-stopped
+    # The core's control API is bound to 127.0.0.1 inside the core's own container.
+    # Sharing its network namespace is what reaches it without exposing 9090 to
+    # order_process, where the consumer stack also lives. There is no TUN, so this
+    # shares the core's network stack without putting the rotator behind the proxy.
+    #
+    # The cost: a container in another's namespace goes stale when that one is
+    # recreated. Always `make up`, never `docker restart proxy_service`.
+    network_mode: "service:proxy_service"
+    # Started, not healthy: the core is unhealthy exactly when the country in play is
+    # dead, which is the moment the rotator is needed most. It retries until the
+    # control API answers.
+    depends_on:
+      proxy_service:
+        condition: service_started
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    # Named rather than env_file: the rotator has no business holding the panel
+    # credential, and this is also the list of what it reads. Compose fills each from
+    # .env; an empty value means the program's own default.
+    environment:
+      PROXY_ROTATION_SECONDS: ${PROXY_ROTATION_SECONDS:-}
+      PROXY_ROTATION_JITTER_SECONDS: ${PROXY_ROTATION_JITTER_SECONDS:-}
+      MIHOMO_API_SECRET: ${MIHOMO_API_SECRET:-}
+
 volumes:
   proxy_nodes:
 

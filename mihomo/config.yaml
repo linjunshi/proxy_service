@@ -40,19 +40,51 @@ proxy-providers:
       lazy: false
 
 proxy-groups:
-  - name: PROXY
+  # One group per country the rotator may park on. The `filter` is a fact about how
+  # the vendor names its nodes (CONTEXT.md §4, item 7), not a policy: *which* countries
+  # this deployment may use is PROXY_REGION_FILTER's job in .env. A group whose filter
+  # matched nothing holds only REJECT, which the rotator reads as "no live node" and
+  # skips -- so a country may be added to or removed from .env without touching this
+  # file, as long as its group is declared here.
+  #
+  # url-test inside the country, because the window must not outlive the node: when the
+  # one in play dies the group moves to the next node of the same country at once,
+  # rather than serving REJECT until the rotator's next switch.
+  #
+  # The anchor carries how a node is tested -- one decision, not six. To add a country,
+  # add a line.
+  - &country
+    name: JP
+    filter: 日本
     type: url-test
     use: [subscription]
     url: https://www.gstatic.com/generate_204
     interval: 60
     tolerance: 50
     lazy: false
-    # The most important line in this file. A group with no members falls back to
-    # COMPATIBLE, which is a DIRECT outbound: a missing, empty or unreadable node
-    # list would silently route every request out of the host's own address -- the
-    # exact failure that retired the previous stack. REJECT refuses instead, which
-    # also turns the container unhealthy rather than quietly serving the wrong exit.
+    # See PROXY below: an empty group must refuse, never fall back to DIRECT.
     empty-fallback: REJECT
+  - {<<: *country, name: US, filter: 美国}
+  - {<<: *country, name: TW, filter: 台湾|台灣|臺灣}
+  - {<<: *country, name: KR, filter: 韩国}
+  - {<<: *country, name: DE, filter: 德国}
+  - {<<: *country, name: IN, filter: 印度}
+
+  # What `rules:` points at, and the only thing the rotator writes: every
+  # PROXY_ROTATION_SECONDS it selects the least recently used country that still has a
+  # live node, so no exit IP faces the consumer's upstream long enough to be worth
+  # blocking. With store-selected false a restart leaves this on the first member until
+  # the rotator's first cycle, seconds later.
+  #
+  # The most important line in this file is the `empty-fallback: REJECT` on each country
+  # above. A group with no members falls back to COMPATIBLE, which is a DIRECT outbound:
+  # a missing, empty or unreadable node list would silently route every request out of
+  # the host's own address -- the exact failure that retired the previous stack. REJECT
+  # refuses instead, which also turns the container unhealthy rather than quietly
+  # serving the wrong exit.
+  - name: PROXY
+    type: select
+    proxies: [JP, US, TW, KR, DE, IN]
 
 # No DIRECT anywhere: with the core up and every node dead, a request must fail rather
 # than leave from the host's own address, which is the whole reason this stack exists.

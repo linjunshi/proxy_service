@@ -1,9 +1,11 @@
 # proxy_service — a headless tunnel for the host and for `order_process`
 
-Two containers, one job. `proxy_service` runs [mihomo](https://github.com/MetaCubeX/mihomo)
+Three containers, one job. `proxy_service` runs [mihomo](https://github.com/MetaCubeX/mihomo)
 from a static config and serves a mixed HTTP/SOCKS proxy. `proxy_refresher` keeps its
 node list fresh from the provider account, because the subscription URL rotates its
-host every few hours and only the credential is durable.
+host every few hours and only the credential is durable. `proxy_rotator` moves the
+tunnel to a different country every quarter hour, so no single exit IP faces the
+consumer's upstream long enough to be worth blocking.
 
 There is no GUI, no desktop, no VNC and no watchdog. The tunnel exists from the moment
 the core starts, and a `docker compose up -d` on a host that has only `.env` is the
@@ -12,8 +14,12 @@ whole deployment.
 ```text
 Windows 127.0.0.1:1082            order_process containers
                  \                 /  (http://proxy_service:1082)
-                  proxy_service ──── mixed port 1082 ── selected node ── internet
-                        ▲
+                  proxy_service ──── mixed port 1082 ── PROXY ─┬─ JP ── fastest live 日本 node ── internet
+                        ▲   ▲                                  ├─ US ── fastest live 美国 node
+                        │   │ PUT /proxies/PROXY               ├─ TW ─ …
+                        │   └──── proxy_rotator ── every 15 min, least recently used
+                        │            (shares this container's network namespace,
+                        │             so the control API stays on loopback)
                         │ reads /config/providers/nodes.yaml (read-only)
                         │
                   proxy_refresher ── every 30 min ── panel API + rotating host
@@ -36,6 +42,8 @@ Copy `.env.example` to `.env` (`make` does it for you) and fill in the account:
 | `PROXY_REGION_FILTER` | `台湾\|台灣\|臺灣\|Taiwan\|TW` | Regex over the node name; only matching nodes are published |
 | `PROXY_REGION_EXCLUDE` | unset | Optional regex; `×[2-9]` skips expensive traffic multipliers |
 | `PROXY_MIN_NODES` | `1` | Below this the refresher refuses to publish and keeps the list it has |
+| `PROXY_ROTATION_SECONDS` | `900` | How long one country serves before the rotator moves on. Minimum 60 |
+| `PROXY_ROTATION_JITTER_SECONDS` | `90` | Spread each switch over ±this, so the changeover is not a clean quarter hour. At most half the window; `0` disables |
 | `REFRESH_INTERVAL_SECONDS` | `1800` | Between successful cycles |
 | `RETRY_INTERVAL_SECONDS` | `300` | After a failed cycle |
 | `MIHOMO_API_SECRET` | empty | The core's control API, which is bound to loopback inside its own container |
@@ -64,6 +72,8 @@ Without `make`: `docker compose build`, `docker compose up -d`.
 | `make up` / `make down` | Start / stop the stack |
 | `make deploy` | `git pull`, build, up |
 | `make refresh` | Restart the refresher, which runs a cycle immediately |
+| `make rotate` | Switch country now — the answer to a block you have actually seen |
+| `make pin C=US` | Hold one country (stops the rotator); `make up` resumes rotation |
 | `make logs` | Follow both containers |
 | `make status` | The verdict — see below |
 | `make nodes` | The node names currently published, for checking a region filter |
@@ -85,14 +95,48 @@ environment:
 The consuming service declares the same external `order_process` network in its own
 Compose project. Nothing about the consumer's lifetime is coupled to this stack's.
 
+## Rotating between countries
+
+The nodes the refresher publishes are grouped by country in `mihomo/config.yaml` — one
+`url-test` group each for `JP US TW KR DE IN` — and `PROXY` is a plain selector over
+them. `proxy_rotator` moves that selector every `PROXY_ROTATION_SECONDS`, picking the
+**least recently used country that still has a live node**. With every country healthy
+that is a round-robin; a country skipped for being dead keeps its place in the queue
+rather than forfeiting its turn, which matters because several countries here are a
+single node.
+
+Inside the window, latency and failover stay mihomo's job: the country's `url-test`
+group serves its fastest live node and moves to the next one of the same country the
+moment that dies, without waiting for the next switch.
+
+Two limits worth knowing:
+
+- **A health check proves a node reaches Google, not that Google still accepts it.**
+  Rotation is prophylaxis on a clock; it cannot detect a block. `make rotate` is the
+  answer to one you have observed, and `make pin C=US` parks the tunnel while you look.
+- **Which countries exist is `mihomo/config.yaml`'s list; which are populated is
+  `PROXY_REGION_FILTER`'s.** A group whose filter matches no published node holds only
+  `REJECT`, reads as `0/0` in `make status`, and is skipped — so a country can be added
+  to or dropped from `.env` without touching the core's config, as long as its group is
+  declared there. Adding a country the config does not know needs one line in
+  `proxy-groups` and one in `PROXY`'s `proxies:`.
+
+The rotator reaches the core's control API by sharing the core's network namespace
+(`network_mode: service:proxy_service`), which is why `external-controller` can stay
+bound to `127.0.0.1` and out of reach of everything else on `order_process`. The cost
+is one operational rule: **always `make up`, never `docker restart proxy_service`** — a
+container in another's namespace goes stale when that one is recreated.
+
 ## Reading `make status`
 
 ```text
 NAME              STATUS
 proxy_service     Up 3 hours (healthy)
 proxy_refresher   Up 3 hours (healthy)
-nodes:     6, published 12 min ago
-selected:  台湾03-×1-客户端
+proxy_rotator     Up 3 hours
+nodes:     24, published 12 min ago
+country:   US via 美国03-×0.3
+live:      JP 8/8  US 7/7  TW 6/6  KR 1/1  DE 1/1  IN 0/1
 exit:      1.34.56.78 through the proxy in 0.31s, 203.0.113.9 direct
 verdict:   UP - HTTPS leaves through the tunnel
 ```
@@ -105,6 +149,9 @@ verdict:   UP - HTTPS leaves through the tunnel
   prevent it) and it means a request went out untunneled. Treat as an incident.
 - **`nodes: … published N min ago`** — a number climbing past `REFRESH_INTERVAL_SECONDS`
   means refresh cycles are failing; `make logs` says why, in one line per cycle.
+- **`live: JP 8/8 …`** — how many of each country's nodes answered their last health
+  check. A country at `0/n` is skipped rather than served; every country at `0` is why
+  a `verdict: DOWN` happened, and the rotator says so once per retry.
 
 ## What each failure looks like
 
@@ -114,7 +161,10 @@ verdict:   UP - HTTPS leaves through the tunnel
 | `refresh failed: … answered HTTP 403` | The panel's Cloudflare rejected our browser signature (`error code: 1010`) | Change `PANEL_USER_AGENT` in `refresher/refresh.py`; any value but Python's default has passed so far |
 | `refresh failed: … carries no proxies: list` | The subscription host answered a dialect we do not speak | Re-run the §"Re-verify" procedure in `CONTEXT.md` |
 | `refresh failed: 0 node(s) match the region filter` | `PROXY_REGION_FILTER` matches nothing the provider currently sells | `make nodes` (old list), widen the filter, `make refresh` |
-| `proxy_service` unhealthy, `verdict: DOWN` | Every published node is dead, or `PROXY_PORT` disagrees with `mixed-port` | `make logs`; widen the filter if the whole region is down |
+| `proxy_service` unhealthy, `verdict: DOWN` | Every published node is dead, or `PROXY_PORT` disagrees with `mixed-port` | `make logs`; the `live:` line in `make status` says which countries still have anything |
+| `rotation held: no country has a live node (…)` | Nothing anywhere answered its health check. The rotator holds rather than parking a window on a dead country | Expected for the first minute after a start; past that, the provider or this host's egress is down |
+| `rotation held: … Connection refused` | The core is not listening yet, or was recreated under the rotator | Expected at boot; otherwise `make up` |
+| `country: unreadable - is the rotator up, or pinned?` | `make pin` stopped the rotator, or it is crash-looping | `make up` to resume rotation, `make logs` if it is not that |
 | `[CacheFile] can't open cache file … read-only file system` | Expected. The rootfs is read-only and nothing in that cache matters here (no stored selection, no fake-ip) | Ignore |
 
 A failed refresh cycle of any cause leaves the previous node list serving and logs how
@@ -122,11 +172,14 @@ stale it now is. A dead panel costs staleness, never an outage.
 
 ## Design decisions worth knowing before you change something
 
-- **Region policy is the refresher's; failover is mihomo's.** The refresher publishes
-  only nodes matching `PROXY_REGION_FILTER`; mihomo runs one `url-test` group over
-  whatever is in the file and picks the fastest that can reach Google. Adding a region
-  is one regex edit and `make refresh`, and cross-region failover then happens on
-  latency automatically.
+- **Three decisions, three owners.** *Which nodes exist* is the refresher's
+  (`PROXY_REGION_FILTER`, a quota and policy decision). *Which country serves now* is
+  the rotator's, on a clock and on health. *Which node inside that country* is mihomo's,
+  on latency. None of them can be moved into another without giving something up: the
+  refresher has no health data, and the core has no clock.
+- **The rotator only ever writes one thing.** `PUT /proxies/PROXY`. It never touches
+  the node list, the config, or the country groups, so the worst a broken rotator can
+  do is leave the tunnel on the country it was already serving.
 - **The health-check URL is a Google endpoint on purpose.** The one consumer talks to
   Google, so a node that cannot is useless however fast it answers something else.
 - **Fail closed.** There is no `DIRECT` in the rules and `empty-fallback: REJECT` on
@@ -138,7 +191,7 @@ stale it now is. A dead panel costs staleness, never an outage.
 - **The core's image is upstream's, unmodified and pinned by digest.** Everything this
   deployment decides lives in `mihomo/config.yaml` and in `.env`.
 - **No kill switch.** Traffic that ignores `HTTPS_PROXY` is not captured; that was
-  TUN's job and TUN was abandoned (`CONTEXT.md` §4). Every endpoint the current
+  TUN's job and TUN was abandoned (`CONTEXT.md` §2). Every endpoint the current
   consumer touches honours the variable.
 
 ## Changing the region filter
@@ -157,6 +210,11 @@ needs nothing installed and no credential copied anywhere.
 
 If the new filter matches nothing, the refresher refuses to publish and the old list
 keeps serving — so a typo costs a log line, not the tunnel.
+
+Removing a country from the filter needs no change in `mihomo/config.yaml`: its group
+goes to `0/0` and the rotator stops choosing it. *Adding* one the config has never
+heard of does — copy a `- {<<: *country, …}` line into `proxy-groups` and add its name
+to `PROXY`'s `proxies:`.
 
 ## Updating the core
 

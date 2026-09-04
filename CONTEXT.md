@@ -8,8 +8,9 @@ build. Dates are absolute.
 
 ## 1. Identity and scope
 
-- A **generic, independent proxy service**: mihomo (upstream's image, unmodified) plus a
-  small sidecar that keeps its node list fresh from the provider account. It offers its
+- A **generic, independent proxy service**: mihomo (upstream's image, unmodified) plus
+  two small sidecars — one that keeps its node list fresh from the provider account,
+  one that moves the live country on a clock. It offers its
   tunnel to the Docker host and to the `order_process` network. It is not a Gemini
   project: consumers depend on it, it depends on no consumer, and consumer-specific
   wiring must never land here.
@@ -54,7 +55,7 @@ capabilities on the core, and consumers joining its network namespace). That pla
 dead. TUN was never observed up on the Windows host, and every endpoint `agy` touches
 honours `HTTPS_PROXY`, so the tunnel bought the one consumer nothing measurable. Do not
 resurrect it from the git history without a consumer that demonstrably needs it — see
-§7 for the trigger that would.
+§8 for the trigger that would.
 
 What replaced it: mihomo run directly from a static config, plus one sidecar that keeps
 the node list fresh using the account credentials. No desktop, no display, no simulated
@@ -217,7 +218,86 @@ PY
 table in §4. That breakage is the silent one: the refresher would keep publishing, just
 a smaller or wrong-format list.
 
-## 6. What the core was measured to do (2026-09-03, local, mihomo v1.19.30)
+## 6. Country rotation (2026-09-04)
+
+**The problem.** A long-lived exit IP is a blockable one. The consumer's upstream
+(Gemini) will refuse an address it has decided it does not like, and no health check
+can see that: a blocked node still fetches `generate_204` in 80 ms. So the defence has
+to be prophylactic — never serve one country long enough to be worth the block.
+
+**Why it cannot live in the core.** mihomo has no time-window primitive. `url-test`
+ranks on latency, `fallback` on health, `load-balance` spreads *per connection* and
+`sticky-sessions` keys on destination. None of them expresses "stay here for fifteen
+minutes". The decision has to come from outside.
+
+**Why it is not the refresher.** The obvious cheap version — have the refresher publish
+only the active country's nodes and rotate on its own clock — needs no new container
+and no config change, and was rejected for one reason: the refresher has no health
+data. It would switch onto a country whose nodes are all down and serve `REJECT` for
+the whole window. With this account that is not hypothetical: 韩国, 德国 and 印度 are a
+**single node each** (measured 2026-09-04: 日本 8, 美国 7, 台湾 6, 韩国 1, 德国 1,
+印度 1 after the filter), so half the countries have no internal redundancy at all.
+Republishing the provider every window would also reset every health-check history and
+drop in-flight connections.
+
+**The shape built instead.** One `url-test` group per country in `mihomo/config.yaml`,
+each with a `filter` over the shared provider; `PROXY` becomes a `select` over those
+groups; `proxy_rotator` reads the core's own health and `PUT`s the selector. The three
+decisions end up with three owners — the refresher chooses which nodes exist, the
+rotator which country serves now, mihomo which node inside it — and none of them can
+be folded into another without losing something the others cannot supply.
+
+**Why the rotator shares the core's network namespace.** `external-controller` is
+`127.0.0.1:9090` *inside* the core's container, and §"Where this can break silently"
+already treats `MIHOMO_API_SECRET` as defence in depth rather than a boundary. Binding
+the API to `0.0.0.0` so a sibling container could reach it would promote that secret to
+*the* boundary, on a network the consumer stack shares. `network_mode:
+service:proxy_service` reaches loopback without widening anything. There is no TUN, so
+sharing the namespace does not put the rotator behind the proxy.
+
+Two consequences to know: a container in another's namespace goes stale when that one
+is recreated (always `make up`), and it cannot declare its own `networks:` or `ports:`.
+It depends on the core `service_started`, **not** `service_healthy` — the core is
+unhealthy exactly when the country in play is dead, which is when the rotator is needed
+most.
+
+### Measured against the live core, 2026-09-04, mihomo v1.19.30
+
+1. **Provider nodes are not in `/proxies`.** That endpoint returns the groups and the
+   core's built-in outbounds (`DIRECT`, `REJECT`, `COMPATIBLE`, `PASS`, …) and nothing
+   else; the nodes behind a `proxy-providers` entry — and their health — live under
+   **`/providers/proxies`**, keyed by provider name. A rotator that looks up a group's
+   `all` members in the `/proxies` map finds nothing and reads every country as dead.
+   This cost a debugging cycle; the two bodies are why `survey()` takes two arguments.
+2. **A group's own `alive` flag is optimistic and useless here.** With every one of the
+   24 published nodes reporting `alive: false` and `delay: 0`, all six country groups
+   still reported `alive: true`. Liveness is read from each node's last recorded delay
+   instead — `history[-1].delay > 0`, or the same under `extra[<testUrl>]`, which is
+   where a check made under a group's own URL is mirrored.
+3. **YAML merge keys work.** `- &country {...}` plus `- {<<: *country, name: US,
+   filter: 美国}` parses correctly in the pinned image, with the explicit keys winning
+   over the merged ones. That is what keeps "how a node is tested" one decision instead
+   of six copies.
+4. **`PUT /proxies/PROXY` with `{"name": "US"}` is accepted** and takes effect at once;
+   `store-selected: false` means the choice does not survive a core restart, and the
+   rotator re-asserts within seconds of one.
+5. **A `filter` matching no published node yields a group holding only `REJECT`.** It
+   does not stop the core and does not fall back to DIRECT, because `empty-fallback:
+   REJECT` is set on every country group. The rotator reads that as `0/0` and skips it,
+   which is what lets `.env` add and drop countries without touching the core's config.
+
+### A crash found while verifying this (fixed 2026-09-04)
+
+The refresher had been dying and restarting rather than retrying. `urllib` converts
+only the errors raised by the *request* into `URLError`; one raised while reading the
+**response** — `http.client.RemoteDisconnected` when the subscription host closes the
+connection mid-answer — propagates raw, past `_get`'s `except urllib.error.URLError`,
+and out of `main`. `restart: unless-stopped` hid it: the container came back and the
+next cycle usually worked. It defeated the documented intent that "a dead panel costs
+staleness, never an outage", and re-logged in on every crash. Both sidecars now catch
+`(OSError, http.client.HTTPException)`, and `TransportTest` in each test file pins it.
+
+## 7. What the core was measured to do (2026-09-03, local, mihomo v1.19.30)
 
 These four behaviours shaped `mihomo/config.yaml` and `compose.yaml`. Re-check them
 when the pinned image changes.
@@ -251,13 +331,24 @@ whichever container mounts it first — Docker's copy-up chowns the volume root 
 the image directory while the volume is still empty, so the refresher (uid 10001) can
 write it regardless of start order.
 
-## 7. Deferred, with the trigger that would revive it
+## 8. Deferred, with the trigger that would revive it
 
-- **Tiered region failover.** Today one `url-test` group ranks whatever the refresher
-  published, on latency. If "US only when every Taiwan node is dead" is ever wanted in
-  preference to latency ranking, replace the single group with `TW` and `US` `url-test`
-  groups over the same provider, each with a `filter`, and a `fallback` group ordered
-  over them; the refresher then stops filtering and publishes everything.
+- **Weighted rotation.** Every country gets an equal window, which is what maximises
+  IP spread but ignores that 德国 and 印度 are one slow node each while 日本 is eight.
+  The seam is `Rotation.next`. The trigger would be a consumer that measurably suffers
+  during the far-country windows — and the cheaper answer first is to drop that country
+  from `PROXY_REGION_FILTER`, not to invent a weighting language.
+- **Rotating the node inside a country.** `url-test` serves one node per country, so a
+  full cycle shows the upstream six IPs, not twenty-four. If six is not enough spread,
+  the options are a `load-balance` group per country (spreads per connection, at the
+  cost of using slow nodes and changing source IP mid-session) or having the rotator
+  choose the node as well as the country (maximum spread, but it reimplements
+  `url-test`'s failover and a node dying mid-window would stay dead until the switch).
+- **Reacting to a block instead of pre-empting it.** The rotator cannot see a block; a
+  consumer that gets `FAILED_PRECONDITION` can. A generic "switch now" trigger the
+  consumer could pull is buildable — `make rotate` is that, by hand — but consumer-specific
+  wiring must not land here (§1), so it would have to be a plain endpoint this service
+  owns.
 - **A kill switch.** Nothing here stops traffic that ignores `HTTPS_PROXY`. That was
   TUN's job. Every endpoint `agy` touches honours the variable, so the exposure equals
   what the pre-GUI deployment already had. Revive only if a consumer appears that does
@@ -269,9 +360,10 @@ write it regardless of start order.
   fetch. Logging it per cycle, and alerting near the 100 GiB cap, is cheap and
   currently unbuilt.
 
-## 8. Re-verification log
+## 9. Re-verification log
 
 | date | vendor build | what changed | what was done |
 | --- | --- | --- | --- |
-| 2026-09-03 | wmsxwd 1.42.3 | Baseline. §4's contract and dialect table established against the live account; §6 measured against mihomo v1.19.30. | The GUI runtime was removed and replaced by this stack. |
+| 2026-09-03 | wmsxwd 1.42.3 | Baseline. §4's contract and dialect table established against the live account; §7 measured against mihomo v1.19.30. | The GUI runtime was removed and replaced by this stack. |
 | 2026-09-03 | — | First live run of the refresher found contract item 8: the panel's Cloudflare answers `403 error code: 1010` to urllib's default User-Agent. The dialect table was re-measured with a parser and the meta row corrected from 48 to 37 proxies. | `PANEL_USER_AGENT` added; §4's table corrected. |
+| 2026-09-04 | — | Country rotation built (§6). Two core behaviours measured that contradict the obvious assumption: provider nodes are absent from `/proxies`, and a group's `alive` flag stays true while every member is dead. A pre-existing crash in the refresher's HTTP error handling was found and fixed. Country populations measured at 日本 8, 美国 7, 台湾 6, 韩国 1, 德国 1, 印度 1. | `proxy_rotator` added; `mihomo/config.yaml` grew six country groups and a selector; `PROXY_ROTATION_SECONDS` and `PROXY_ROTATION_JITTER_SECONDS` added to `.env`. |

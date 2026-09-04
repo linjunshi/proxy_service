@@ -9,10 +9,13 @@ Run: python3 -m unittest discover -s refresher
 
 from __future__ import annotations
 
+import http.client
 import os
 import re
 import tempfile
 import unittest
+import urllib.error
+from unittest import mock
 from pathlib import Path
 
 import yaml
@@ -120,6 +123,37 @@ class RedactionTest(unittest.TestCase):
 
     def test_credentials_in_a_url_never_reach_a_log_line(self):
         self.assertEqual(refresh._public("https://user:pw@panel.example.invalid/api"), "https://panel.example.invalid/api")
+
+
+class TransportTest(unittest.TestCase):
+    """Every network fault must become a RefreshError, so a cycle retries rather than dies.
+
+    urllib converts only what the *request* raises into a URLError; a peer that closes
+    the connection while the response is read escapes as a raw http.client error, which
+    once crashed the process and let Docker restart it in place of a logged retry.
+    """
+
+    FAULTS = [
+        http.client.RemoteDisconnected("Remote end closed connection without response"),
+        http.client.BadStatusLine("\x15\x03\x03"),
+        http.client.IncompleteRead(b"half"),
+        ConnectionResetError(104, "Connection reset by peer"),
+        urllib.error.URLError("[SSL] certificate verify failed"),
+        TimeoutError(),
+    ]
+
+    def test_a_fault_mid_response_is_named_not_raised(self):
+        for fault in self.FAULTS:
+            with self.subTest(fault=type(fault).__name__), \
+                    mock.patch("urllib.request.urlopen", side_effect=fault):
+                with self.assertRaises(refresh.RefreshError):
+                    refresh._get("https://panel.example.invalid/api")
+
+    def test_the_message_never_carries_the_subscription_token(self):
+        with mock.patch("urllib.request.urlopen", side_effect=http.client.RemoteDisconnected("closed")):
+            with self.assertRaises(refresh.RefreshError) as raised:
+                refresh._get("http://host.invalid/w/wm?token=SECRET")
+        self.assertNotIn("SECRET", str(raised.exception))
 
 
 class SettingsTest(unittest.TestCase):
