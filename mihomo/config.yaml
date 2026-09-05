@@ -49,7 +49,8 @@ proxy-groups:
   #
   # url-test inside the country, because the window must not outlive the node: when the
   # one in play dies the group moves to the next node of the same country at once,
-  # rather than serving REJECT until the rotator's next switch.
+  # rather than serving REJECT until the rotator's next switch. It makes no other move:
+  # see `tolerance` below.
   #
   # The anchor carries how a node is tested -- one decision, not six. To add a country,
   # add a line.
@@ -60,7 +61,13 @@ proxy-groups:
     use: [subscription]
     url: https://www.gstatic.com/generate_204
     interval: 60
-    tolerance: 50
+    # Stay on one node until it dies. The group switches only when another node beats
+    # the one in play by more than this, and none can: the health check gives up at 5 s.
+    # That is what lets a client pinned to this group (see `rules:`) keep one exit for a
+    # whole unit of work. The old 50 ms moved the exit about once a minute, and a 16-bit
+    # wrap in the core's comparison also jumped it onto an untested node after every
+    # change to the node list (CONTEXT.md §9).
+    tolerance: 5000
     lazy: false
     # See PROXY below: an empty group must refuse, never fall back to DIRECT.
     empty-fallback: REJECT
@@ -86,7 +93,21 @@ proxy-groups:
     type: select
     proxies: [JP, US, TW, KR, DE, IN]
 
+# The pin. A client that puts a country's name in its proxy username -- for example
+# http://US:<request id>@proxy_service:1082 -- is routed to that country's group for as
+# long as it sends that name, while PROXY keeps rotating for everyone else. The core
+# reads that username even with no `authentication:` set, and never reads the password
+# (verified on v1.19.30), so untagged clients are unaffected and the password is free to
+# carry a request id. A country is three lines in this file, all under the same name:
+# its group above, its place in PROXY, and its tag here.
+#
 # No DIRECT anywhere: with the core up and every node dead, a request must fail rather
 # than leave from the host's own address, which is the whole reason this stack exists.
 rules:
+  - IN-USER,JP,JP
+  - IN-USER,US,US
+  - IN-USER,TW,TW
+  - IN-USER,KR,KR
+  - IN-USER,DE,DE
+  - IN-USER,IN,IN
   - MATCH,PROXY

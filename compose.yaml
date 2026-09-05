@@ -69,6 +69,12 @@ services:
   # Moves the live country every PROXY_ROTATION_SECONDS, so no exit IP faces the
   # consumer's upstream long enough to be worth blocking. Same image as the refresher,
   # different program.
+  #
+  # It also answers GET /current on PROXY_CURRENT_PORT: the country a consumer names in
+  # its proxy username to keep one unit of work on one exit (README, "Pinning"). It
+  # listens in the core's namespace, so consumers reach it at proxy_service:<port> and
+  # no `ports:` is needed here -- to expose it on the host, publish that port on
+  # proxy_service above, since this container cannot declare ports of its own.
   rotator:
     build: ./refresher
     command: ["/app/rotate.py"]
@@ -99,6 +105,7 @@ services:
     environment:
       PROXY_ROTATION_SECONDS: ${PROXY_ROTATION_SECONDS:-}
       PROXY_ROTATION_JITTER_SECONDS: ${PROXY_ROTATION_JITTER_SECONDS:-}
+      PROXY_CURRENT_PORT: ${PROXY_CURRENT_PORT:-}
       MIHOMO_API_SECRET: ${MIHOMO_API_SECRET:-}
 
 volumes:

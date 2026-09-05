@@ -1,7 +1,10 @@
-"""Tests for the parts of the rotator that decide which country serves next.
+"""Tests for the parts of the rotator that decide which country serves next, and for
+the answer it gives consumers.
 
-The HTTP edges are not tested here: everything worth getting wrong -- reading the
+The control-API edge is not tested: everything worth getting wrong there -- reading the
 core's health, and choosing from it -- is a pure function over the `/proxies` body.
+`/current` is driven over a real loopback socket instead, because what it promises a
+consumer is an HTTP answer.
 
 Run: python3 -m unittest discover -s refresher
 """
@@ -17,6 +20,13 @@ import urllib.error
 from unittest import mock
 
 import rotate
+
+
+def settings(**overrides) -> rotate.Settings:
+    """Settings for a test; port 0 lets the endpoint take any free port."""
+    values = dict(secret="", window_seconds=900, jitter_seconds=0, current_port=0)
+    values.update(overrides)
+    return rotate.Settings(**values)
 
 
 def snapshot(selected: str | None = None, **countries: list[int | None]) -> tuple[dict, dict]:
@@ -135,7 +145,7 @@ class SettingsTest(unittest.TestCase):
     def setUp(self):
         self.saved = dict(os.environ)
         for name in list(os.environ):
-            if name.startswith(("PROXY_ROTATION_", "MIHOMO_")):
+            if name.startswith(("PROXY_ROTATION_", "PROXY_CURRENT_", "MIHOMO_")):
                 del os.environ[name]
 
     def tearDown(self):
@@ -162,11 +172,19 @@ class SettingsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "PROXY_ROTATION_SECONDS"):
             rotate.Settings.from_env()
 
+    def test_the_current_endpoint_has_a_port_of_its_own_by_default(self):
+        self.assertEqual(rotate.Settings.from_env().current_port, rotate.DEFAULT_CURRENT_PORT)
+
+    def test_a_number_that_is_not_a_port_refuses_to_start(self):
+        os.environ["PROXY_CURRENT_PORT"] = "70000"
+        with self.assertRaisesRegex(ValueError, "PROXY_CURRENT_PORT"):
+            rotate.Settings.from_env()
+
 
 class CycleTest(unittest.TestCase):
     """One cycle writes to the core only when the country it chose is not the one serving."""
 
-    SETTINGS = rotate.Settings(secret="", window_seconds=900, jitter_seconds=0)
+    SETTINGS = settings()
 
     def cycle(self, state):
         with mock.patch.object(rotate, "_fetch", return_value=state), \
@@ -187,9 +205,8 @@ class CycleTest(unittest.TestCase):
 
 class SelectTest(unittest.TestCase):
     def test_the_selector_group_is_moved_by_name(self):
-        settings = rotate.Settings(secret="", window_seconds=900, jitter_seconds=0)
         with mock.patch.object(rotate, "_call") as call:
-            rotate._select(settings, "US")
+            rotate._select(settings(), "US")
         (_, method, path), keywords = call.call_args
         self.assertEqual((method, path), ("PUT", f"/proxies/{rotate.SELECTOR_GROUP}"))
         self.assertEqual(json.loads(keywords["body"]), {"name": "US"})
@@ -206,12 +223,101 @@ class TransportTest(unittest.TestCase):
     ]
 
     def test_every_fault_becomes_a_held_rotation(self):
-        settings = rotate.Settings(secret="", window_seconds=900, jitter_seconds=0)
         for fault in self.FAULTS:
             with self.subTest(fault=type(fault).__name__), \
                     mock.patch("urllib.request.urlopen", side_effect=fault):
                 with self.assertRaises(rotate.RotationError):
-                    rotate._json(settings, "/proxies")
+                    rotate._json(settings(), "/proxies")
+
+
+class TagRulesTest(unittest.TestCase):
+    """A country is pinnable only when the core carries `IN-USER,<name>,<name>` for it."""
+
+    @staticmethod
+    def rules(*pairs: tuple[str, str]) -> dict:
+        tagged = [{"type": "InUser", "payload": user, "proxy": group, "size": -1} for user, group in pairs]
+        return {"rules": tagged + [{"type": "Match", "payload": "", "proxy": "PROXY", "size": -1}]}
+
+    def setUp(self):
+        _, self.countries = rotate.survey(*snapshot(JP=[120], US=[90]))
+
+    def test_every_country_with_its_rule_is_pinnable(self):
+        self.assertEqual(rotate.missing_tag_rules(self.rules(("JP", "JP"), ("US", "US")), self.countries), [])
+
+    def test_a_country_without_a_rule_is_named(self):
+        self.assertEqual(rotate.missing_tag_rules(self.rules(("JP", "JP")), self.countries), ["US"])
+
+    def test_a_tag_sent_to_another_group_does_not_count(self):
+        # The tag has to be the group's own name: `IN-USER,US,JP` would silently send a
+        # consumer that asked for US to Japan.
+        self.assertEqual(rotate.missing_tag_rules(self.rules(("JP", "JP"), ("US", "JP")), self.countries), ["US"])
+
+    def test_a_core_with_no_rules_body_leaves_every_country_unpinnable(self):
+        self.assertEqual(rotate.missing_tag_rules({}, self.countries), ["JP", "US"])
+
+    def test_the_rotator_says_once_which_way_the_check_went(self):
+        with mock.patch.object(rotate, "_json", return_value=self.rules(("JP", "JP"), ("US", "US"))), \
+                self.assertLogs(rotate.LOG, level="INFO") as logged:
+            rotate._verify_tag_rules(settings(), self.countries)
+        self.assertIn("every member of PROXY has its IN-USER rule: JP US", logged.output[0])
+        with mock.patch.object(rotate, "_json", return_value=self.rules(("JP", "JP"))), \
+                self.assertLogs(rotate.LOG, level="ERROR") as logged:
+            rotate._verify_tag_rules(settings(), self.countries)
+        self.assertIn("no IN-USER rule pins US", logged.output[0])
+
+
+class CurrentTest(unittest.TestCase):
+    """The endpoint answers in the core's own names, and echoes only a well-formed request id."""
+
+    def setUp(self):
+        server = rotate.serve_current(settings(current_port=0))
+        self.port = server.server_address[1]
+        self.addCleanup(server.server_close)
+        self.addCleanup(server.shutdown)
+        # No environment proxy should sit between this test and its own loopback server.
+        self.opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+    def get(self, path: str) -> tuple[int, dict]:
+        try:
+            with self.opener.open(f"http://127.0.0.1:{self.port}{path}", timeout=5) as response:
+                return response.status, json.load(response)
+        except urllib.error.HTTPError as error:
+            return error.code, json.load(error)
+
+    def test_answers_the_selected_country_and_the_node_serving_it(self):
+        with mock.patch.object(rotate, "_fetch", return_value=snapshot(selected="US", JP=[120], US=[90])):
+            self.assertEqual(self.get("/current"), (200, {"country": "US", "via": "US01"}))
+
+    def test_logs_a_well_formed_request_id_beside_its_answer(self):
+        with mock.patch.object(rotate, "_fetch", return_value=snapshot(selected="US", US=[90])), \
+                self.assertLogs(rotate.LOG, level="INFO") as logged:
+            self.get("/current?request=dag-2026-09-05.task_7:try2")
+        self.assertIn("current: dag-2026-09-05.task_7:try2 -> US via US01", logged.output[0])
+
+    def test_does_not_echo_a_request_id_of_another_shape(self):
+        with mock.patch.object(rotate, "_fetch", return_value=snapshot(selected="US", US=[90])), \
+                self.assertLogs(rotate.LOG, level="INFO") as logged:
+            self.get("/current?request=%0Afake%20line")
+        self.assertNotIn("fake", logged.output[0])
+        self.assertIn("malformed", logged.output[0])
+
+    def test_says_nothing_when_no_request_id_was_sent(self):
+        with mock.patch.object(rotate, "_fetch", return_value=snapshot(selected="US", US=[90])), \
+                self.assertNoLogs(rotate.LOG, level="INFO"):
+            self.get("/current")
+
+    def test_a_core_that_cannot_be_read_is_a_503_not_a_guess(self):
+        with mock.patch.object(rotate, "_fetch", side_effect=rotate.RotationError("GET /proxies unreachable")):
+            status, body = self.get("/current")
+        self.assertEqual(status, 503)
+        self.assertIn("unreachable", body["error"])
+
+    def test_a_core_with_nothing_selected_is_a_503(self):
+        with mock.patch.object(rotate, "_fetch", return_value=snapshot(selected=None, US=[90])):
+            self.assertEqual(self.get("/current")[0], 503)
+
+    def test_any_other_path_is_a_404(self):
+        self.assertEqual(self.get("/proxies")[0], 404)
 
 
 if __name__ == "__main__":

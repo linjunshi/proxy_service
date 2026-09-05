@@ -338,8 +338,9 @@ write it regardless of start order.
   The seam is `Rotation.next`. The trigger would be a consumer that measurably suffers
   during the far-country windows — and the cheaper answer first is to drop that country
   from `PROXY_REGION_FILTER`, not to invent a weighting language.
-- **Rotating the node inside a country.** `url-test` serves one node per country, so a
-  full cycle shows the upstream six IPs, not twenty-four. If six is not enough spread,
+- **Rotating the node inside a country.** `url-test` serves one node per country and,
+  since §9, stays on it until it dies, so a full cycle shows the upstream six IPs rather
+  than twenty-four. If six is not enough spread,
   the options are a `load-balance` group per country (spreads per connection, at the
   cost of using slow nodes and changing source IP mid-session) or having the rotator
   choose the node as well as the country (maximum spread, but it reimplements
@@ -347,8 +348,8 @@ write it regardless of start order.
 - **Reacting to a block instead of pre-empting it.** The rotator cannot see a block; a
   consumer that gets `FAILED_PRECONDITION` can. A generic "switch now" trigger the
   consumer could pull is buildable — `make rotate` is that, by hand — but consumer-specific
-  wiring must not land here (§1), so it would have to be a plain endpoint this service
-  owns.
+  wiring must not land here (§1). The rotator's read-only `/current` (§9) is that plain
+  endpoint, and a "switch now" verb would sit beside it.
 - **A kill switch.** Nothing here stops traffic that ignores `HTTPS_PROXY`. That was
   TUN's job. Every endpoint `agy` touches honours the variable, so the exposure equals
   what the pre-GUI deployment already had. Revive only if a consumer appears that does
@@ -360,10 +361,81 @@ write it regardless of start order.
   fetch. Logging it per cycle, and alerting near the 100 GiB cap, is cheap and
   currently unbuilt.
 
-## 9. Re-verification log
+## 9. Pinning a unit of work to its exit (2026-09-05)
+
+**The problem.** Consumer requests failed when the rotator switched country mid-request,
+and worked when the consumer started just after a switch. What the v1.19.30 source and
+this host's core log show:
+
+- `PUT /proxies/PROXY` closes nothing. `Selector.Set` assigns a name and returns
+  (`hub/route/proxies.go`, `adapter/outboundgroup/selector.go`), so a connection keeps
+  its node to the end and only later connections see the new country.
+- One agy run is not one connection. The core logs 23-48 CONNECT tunnels per agy start,
+  one per HTTP request, with gaps of up to 13 s. Each picks its exit as it opens, so a
+  switch mid-run splits the run between two countries and the upstream sees one
+  authenticated session change continent.
+- The core answers CONNECT with `200 Connection established` *before* it dials the node
+  (`listener/http/proxy.go`). A dial that fails after that, or a group holding only
+  REJECT, reaches the client as `EOF` in the TLS handshake. agy reads an EOF on its auth
+  path as "not logged in", waits 60 s for a sign-in, then reports "authentication failed
+  or timed out" — which the consumer took for a lapsed login, judged by an egress check
+  that runs only after that minute, by which time the proxy is fine again.
+- A provider hot reload closes nothing either: `closeAllConnections` runs only in
+  `Initial()`, and the fetcher skips content whose hash has not changed
+  (`component/resource/fetcher.go`). A real list change does rebuild every node with
+  `alive: true` and no history.
+
+**What was chosen.** The unit worth protecting is one agy subprocess, and only the
+consumer knows where one begins and ends. So the consumer stamps each subprocess: it
+asks the rotator which country is current and names it in the proxy username for that
+subprocess's whole life. The core routes that name to the country's group (`IN-USER`
+rules) while `PROXY` keeps rotating for everyone else, which makes rotation gradual —
+work in flight keeps its country, new work starts on the new one.
+
+Three facts from the v1.19.30 source hold this up:
+
+1. **The proxy username is read even with no `authentication:` set.** `authenticate()`
+   in `listener/http/proxy.go` parses `Proxy-Authorization` first and treats a nil
+   authenticator as authorised; the user lands in `metadata.InUser`, which `IN-USER`
+   matches exactly. The password is never read, logged or exposed — the `/connections`
+   API carries `inboundUser` only — so a request id there serves packet captures and
+   uniqueness, not the core.
+2. **A per-listener `proxy:` binding exists** (`listeners:` with `type: mixed`;
+   `SpecialProxy` in `listener/inbound/base.go`, resolved in `tunnel.resolveMetadata`).
+   That was the other way to stamp a run, one port per country, and it lost on rollout:
+   a consumer pointed at a port that does not exist yet fails outright, while a tag sent
+   to a core without the rules merely rotates.
+3. **url-test's `tolerance` is added to a 16-bit delay.** An untested node reports
+   `0xffff`, and `0xffff + 50` wraps to 49, so `tolerance: 50` jumped the group onto an
+   untested first-listed node after every real list change. At 5000, above the health
+   check's own timeout, no live node can displace the one in play: the group stays until
+   that node dies, which is what a pinned consumer needs.
+
+Pinning to a node rather than a country was rejected. Rules and listeners are static
+while the node list is not, so it would need pre-declared slot groups and a lease
+protocol, and would give up the in-country failover `url-test` provides for free. A
+sticky country group is the same guarantee with one exception, the node dying, which is
+the right exception.
+
+**The contract.** `GET http://proxy_service:${PROXY_CURRENT_PORT}/current` answers
+`{"country": "<PROXY's now>", "via": "<that group's node>"}` straight from the core, so
+a group renamed in `mihomo/config.yaml` propagates with no other change. `?request=<id>`
+makes the rotator log `current: <id> -> US via <node>`, the proxy-side end of a trace.
+The consumer then starts its subprocess with
+`HTTPS_PROXY=http://<country>:<request id>@proxy_service:1082`. After its first cycle
+the rotator reads `/rules` and logs an error for every member of `PROXY` with no
+`IN-USER,<name>,<name>` line; `make status` prints the same under `pins:`.
+
+Found on the way: the consumer's container on this host predated its own egress-check
+commits, so its boot gate passed a `REJECT` tunnel — a stand-in that answers `200
+Connection established` and closes, which that build read as "carrying traffic" and the
+current code reports as `UNEXPECTED_EOF_WHILE_READING`.
+
+## 10. Re-verification log
 
 | date | vendor build | what changed | what was done |
 | --- | --- | --- | --- |
 | 2026-09-03 | wmsxwd 1.42.3 | Baseline. §4's contract and dialect table established against the live account; §7 measured against mihomo v1.19.30. | The GUI runtime was removed and replaced by this stack. |
 | 2026-09-03 | — | First live run of the refresher found contract item 8: the panel's Cloudflare answers `403 error code: 1010` to urllib's default User-Agent. The dialect table was re-measured with a parser and the meta row corrected from 48 to 37 proxies. | `PANEL_USER_AGENT` added; §4's table corrected. |
 | 2026-09-04 | — | Country rotation built (§6). Two core behaviours measured that contradict the obvious assumption: provider nodes are absent from `/proxies`, and a group's `alive` flag stays true while every member is dead. A pre-existing crash in the refresher's HTTP error handling was found and fixed. Country populations measured at 日本 8, 美国 7, 台湾 6, 韩国 1, 德国 1, 印度 1. | `proxy_rotator` added; `mihomo/config.yaml` grew six country groups and a selector; `PROXY_ROTATION_SECONDS` and `PROXY_ROTATION_JITTER_SECONDS` added to `.env`. |
+| 2026-09-05 | — | Consumer requests failed when the rotator switched mid-run (§9). Established that a switch closes nothing, that one agy run is 23-48 tunnels each choosing its exit when it opens, and that a failed dial reaches the client as `EOF` after a `200` to CONNECT. Verified that the proxy username is parsed with no authentication configured, and a 16-bit wrap in url-test's tolerance comparison. | `IN-USER` pin rules and `tolerance: 5000` in `mihomo/config.yaml`; `GET /current` and a `pins:` status line in the rotator; `PROXY_CURRENT_PORT` in `.env`. |

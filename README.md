@@ -5,7 +5,9 @@ from a static config and serves a mixed HTTP/SOCKS proxy. `proxy_refresher` keep
 node list fresh from the provider account, because the subscription URL rotates its
 host every few hours and only the credential is durable. `proxy_rotator` moves the
 tunnel to a different country every quarter hour, so no single exit IP faces the
-consumer's upstream long enough to be worth blocking.
+consumer's upstream long enough to be worth blocking. A consumer that needs one unit of
+work to keep one exit names a country in its proxy username and stays there, whatever the
+rotator does meanwhile.
 
 There is no GUI, no desktop, no VNC and no watchdog. The tunnel exists from the moment
 the core starts, and a `docker compose up -d` on a host that has only `.env` is the
@@ -13,13 +15,14 @@ whole deployment.
 
 ```text
 Windows 127.0.0.1:1082            order_process containers
-                 \                 /  (http://proxy_service:1082)
-                  proxy_service ──── mixed port 1082 ── PROXY ─┬─ JP ── fastest live 日本 node ── internet
-                        ▲   ▲                                  ├─ US ── fastest live 美国 node
-                        │   │ PUT /proxies/PROXY               ├─ TW ─ …
+                 \                 /  (http://proxy_service:1082; http://US:<id>@… pins to US)
+                  proxy_service ──── mixed port 1082 ─┬─ IN-USER,<country> ── that country's group
+                        ▲   ▲                         └─ MATCH ── PROXY ─┬─ JP ── the 日本 node in play ── internet
+                        │   │ PUT /proxies/PROXY                         ├─ US ── the 美国 node in play
                         │   └──── proxy_rotator ── every 15 min, least recently used
-                        │            (shares this container's network namespace,
-                        │             so the control API stays on loopback)
+                        │            (shares this container's network namespace, so the
+                        │             control API stays on loopback; answers GET /current
+                        │             on proxy_service:1083 — which country to pin to)
                         │ reads /config/providers/nodes.yaml (read-only)
                         │
                   proxy_refresher ── every 30 min ── panel API + rotating host
@@ -44,6 +47,7 @@ Copy `.env.example` to `.env` (`make` does it for you) and fill in the account:
 | `PROXY_MIN_NODES` | `1` | Below this the refresher refuses to publish and keeps the list it has |
 | `PROXY_ROTATION_SECONDS` | `900` | How long one country serves before the rotator moves on. Minimum 60 |
 | `PROXY_ROTATION_JITTER_SECONDS` | `90` | Spread each switch over ±this, so the changeover is not a clean quarter hour. At most half the window; `0` disables |
+| `PROXY_CURRENT_PORT` | `1083` | The rotator's `GET /current`, inside the core's namespace: `proxy_service:1083` on `order_process`. Not published on the host |
 | `REFRESH_INTERVAL_SECONDS` | `1800` | Between successful cycles |
 | `RETRY_INTERVAL_SECONDS` | `300` | After a failed cycle |
 | `MIHOMO_API_SECRET` | empty | The core's control API, which is bound to loopback inside its own container |
@@ -95,6 +99,9 @@ environment:
 The consuming service declares the same external `order_process` network in its own
 Compose project. Nothing about the consumer's lifetime is coupled to this stack's.
 
+A consumer whose unit of work opens many connections should pin it to one exit instead
+of riding the rotation — see "Pinning one unit of work to one exit" below.
+
 ## Rotating between countries
 
 The nodes the refresher publishes are grouped by country in `mihomo/config.yaml` — one
@@ -105,9 +112,11 @@ that is a round-robin; a country skipped for being dead keeps its place in the q
 rather than forfeiting its turn, which matters because several countries here are a
 single node.
 
-Inside the window, latency and failover stay mihomo's job: the country's `url-test`
-group serves its fastest live node and moves to the next one of the same country the
-moment that dies, without waiting for the next switch.
+Inside the window the node is mihomo's job: the country's `url-test` group picks its
+fastest live node, stays on it until it dies, then moves to the next live node of the
+same country without waiting for the next switch. Staying put is `tolerance` in
+`mihomo/config.yaml`, set high enough that no live node can displace the one in play —
+a pinned consumer needs one exit for its whole run, not the fastest exit each minute.
 
 Two limits worth knowing:
 
@@ -118,14 +127,41 @@ Two limits worth knowing:
   `PROXY_REGION_FILTER`'s.** A group whose filter matches no published node holds only
   `REJECT`, reads as `0/0` in `make status`, and is skipped — so a country can be added
   to or dropped from `.env` without touching the core's config, as long as its group is
-  declared there. Adding a country the config does not know needs one line in
-  `proxy-groups` and one in `PROXY`'s `proxies:`.
+  declared there. Adding a country the config does not know needs three lines: its
+  group, its name in `PROXY`'s `proxies:`, and its `IN-USER` rule.
 
 The rotator reaches the core's control API by sharing the core's network namespace
 (`network_mode: service:proxy_service`), which is why `external-controller` can stay
 bound to `127.0.0.1` and out of reach of everything else on `order_process`. The cost
 is one operational rule: **always `make up`, never `docker restart proxy_service`** — a
 container in another's namespace goes stale when that one is recreated.
+
+## Pinning one unit of work to one exit
+
+A consumer that opens many connections for one piece of work — an agy run opens dozens
+over its lifetime — must not have the country change halfway through: the work would
+leave from two countries, and its upstream sees one session that moved continent. A
+switch only affects connections opened after it, so the fix is for each unit of work to
+choose its exit once, at the start, and keep it.
+
+1. Ask which country is current: `GET http://proxy_service:1083/current` answers
+   `{"country": "US", "via": "美国03-×0.3"}`. Add `?request=<id>` and the rotator logs
+   `current: <id> -> US via 美国03-×0.3`, the proxy-side end of a trace.
+2. Name that country in the proxy username for the whole unit of work:
+   `HTTPS_PROXY=http://US:<request id>@proxy_service:1082`. Every connection carrying
+   that name goes to the `US` group, whatever `PROXY` does meanwhile. Nothing here reads
+   the password, so a request id costs nothing there and ties a packet capture to a trace.
+3. Start the work. The node inside the country stays until it dies, so in practice the
+   exit is one IP for the whole run.
+
+Rotation is then gradual: work in flight keeps its country, new work starts on the new
+one. Untagged traffic rotates exactly as before, so nothing changes for a consumer that
+does not pin, and the two sides can be deployed in either order — a tag sent to a core
+without the rules simply rotates.
+
+`make status` prints `pins:` with every country a tag reaches. A country missing there
+has no `- IN-USER,<name>,<name>` line above `MATCH`, and the rotator says so in its log
+at start.
 
 ## Reading `make status`
 
@@ -137,6 +173,7 @@ proxy_rotator     Up 3 hours
 nodes:     24, published 12 min ago
 country:   US via 美国03-×0.3
 live:      JP 8/8  US 7/7  TW 6/6  KR 1/1  DE 1/1  IN 0/1
+pins:      JP US TW KR DE IN
 exit:      1.34.56.78 through the proxy in 0.31s, 203.0.113.9 direct
 verdict:   UP - HTTPS leaves through the tunnel
 ```
@@ -152,6 +189,9 @@ verdict:   UP - HTTPS leaves through the tunnel
 - **`live: JP 8/8 …`** — how many of each country's nodes answered their last health
   check. A country at `0/n` is skipped rather than served; every country at `0` is why
   a `verdict: DOWN` happened, and the rotator says so once per retry.
+- **`pins: JP US …`** — the countries a proxy username reaches. A country under
+  `(no IN-USER rule for …)` has no line in `mihomo/config.yaml`, so a consumer naming it
+  rotates with everyone else and cannot tell.
 
 ## What each failure looks like
 
@@ -165,6 +205,8 @@ verdict:   UP - HTTPS leaves through the tunnel
 | `rotation held: no country has a live node (…)` | Nothing anywhere answered its health check. The rotator holds rather than parking a window on a dead country | Expected for the first minute after a start; past that, the provider or this host's egress is down |
 | `rotation held: … Connection refused` | The core is not listening yet, or was recreated under the rotator | Expected at boot; otherwise `make up` |
 | `country: unreadable - is the rotator up, or pinned?` | `make pin` stopped the rotator, or it is crash-looping | `make up` to resume rotation, `make logs` if it is not that |
+| `no IN-USER rule pins X`, or `pins: … (no IN-USER rule for X)` | A member of `PROXY` has no tag rule, so a consumer that names it in its proxy username is not pinned | Add `- IN-USER,X,X` above `MATCH` in `mihomo/config.yaml`, then `make down` and `make up` so the core re-reads it |
+| `refusing to start: cannot listen on port 1083` | Something else in the core's network namespace holds `PROXY_CURRENT_PORT` | Change it in `.env`, `make up`; tell the consumer |
 | `[CacheFile] can't open cache file … read-only file system` | Expected. The rootfs is read-only and nothing in that cache matters here (no stored selection, no fake-ip) | Ignore |
 
 A failed refresh cycle of any cause leaves the previous node list serving and logs how
@@ -179,7 +221,10 @@ stale it now is. A dead panel costs staleness, never an outage.
   refresher has no health data, and the core has no clock.
 - **The rotator only ever writes one thing.** `PUT /proxies/PROXY`. It never touches
   the node list, the config, or the country groups, so the worst a broken rotator can
-  do is leave the tunnel on the country it was already serving.
+  do is leave the tunnel on the country it was already serving. `/current` is a read.
+- **A consumer pins by name, and the name is the group's.** The core routes a proxy
+  username to the group of the same name, and `/current` answers with the name the core
+  reports, so `mihomo/config.yaml` is the only place countries are named.
 - **The health-check URL is a Google endpoint on purpose.** The one consumer talks to
   Google, so a node that cannot is useless however fast it answers something else.
 - **Fail closed.** There is no `DIRECT` in the rules and `empty-fallback: REJECT` on
@@ -213,8 +258,8 @@ keeps serving — so a typo costs a log line, not the tunnel.
 
 Removing a country from the filter needs no change in `mihomo/config.yaml`: its group
 goes to `0/0` and the rotator stops choosing it. *Adding* one the config has never
-heard of does — copy a `- {<<: *country, …}` line into `proxy-groups` and add its name
-to `PROXY`'s `proxies:`.
+heard of does — copy a `- {<<: *country, …}` line into `proxy-groups`, add its name to
+`PROXY`'s `proxies:`, and add its `- IN-USER,<name>,<name>` line above `MATCH`.
 
 ## Updating the core
 
