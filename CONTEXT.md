@@ -286,6 +286,38 @@ most.
    REJECT` is set on every country group. The rotator reads that as `0/0` and skips it,
    which is what lets `.env` add and drop countries without touching the core's config.
 
+### Leaving a dead country mid-window (2026-09-07)
+
+**The problem.** The rotator chose a country and slept out the whole window. When that
+country's last node died mid-window -- and 韩国, 德国 and 印度 are one node each -- the
+selector stayed on it until the next switch, and the core kept dialing the dead node:
+`url-test` with nothing alive parks on its first member, so every connection got the
+`200` then `EOF` of §9. Up to a quarter of an hour of that, from a health check the
+core had already failed.
+
+**What was built.** The sleep became a watch (`watch()` in `refresher/rotate.py`):
+every `WATCH_SECONDS` (15) the rotator re-reads the same two bodies `survey()` always
+read, and ends the window the moment the country the core is serving is *dead*. The
+next cycle is the ordinary one, so the LRU order and the "hold when nothing is live"
+rule are unchanged; the early switch just arrives sooner. Detection is bounded by the
+core, not the rotator: the health check runs once a minute with a 5 s timeout, so a
+dead country is left within about 65 s worst case plus one look.
+
+**Dead is narrower than ineligible, on purpose.** A real change to the node list
+rebuilds every node with `alive: true` and no history (§9), so for a few seconds every
+country reads `0/n`. Had the watch treated that as dead, every refresh that changed the
+list would have forced a switch. So `Country` now carries `untested` beside `live`, and
+`is_dead` is "no live node and none still awaiting its first check" -- an unknown
+country is a reason to wait, not to leave. `is_eligible` (a destination) is still
+`live > 0`. A member the providers do not report at all has no check coming and counts
+as failed, and a country whose members all left the list (`0/0`) is dead: nothing
+there will ever answer.
+
+Not changed: a core that cannot be read mid-window is not a dead country, so the watch
+logs and goes on rather than ending the window on a transient. A pinned consumer whose
+country dies is still broken until its next unit of work, which is the exception §9
+accepted.
+
 ### A crash found while verifying this (fixed 2026-09-04)
 
 The refresher had been dying and restarting rather than retrying. `urllib` converts
@@ -439,3 +471,4 @@ current code reports as `UNEXPECTED_EOF_WHILE_READING`.
 | 2026-09-03 | — | First live run of the refresher found contract item 8: the panel's Cloudflare answers `403 error code: 1010` to urllib's default User-Agent. The dialect table was re-measured with a parser and the meta row corrected from 48 to 37 proxies. | `PANEL_USER_AGENT` added; §4's table corrected. |
 | 2026-09-04 | — | Country rotation built (§6). Two core behaviours measured that contradict the obvious assumption: provider nodes are absent from `/proxies`, and a group's `alive` flag stays true while every member is dead. A pre-existing crash in the refresher's HTTP error handling was found and fixed. Country populations measured at 日本 8, 美国 7, 台湾 6, 韩国 1, 德国 1, 印度 1. | `proxy_rotator` added; `mihomo/config.yaml` grew six country groups and a selector; `PROXY_ROTATION_SECONDS` and `PROXY_ROTATION_JITTER_SECONDS` added to `.env`. |
 | 2026-09-05 | — | Consumer requests failed when the rotator switched mid-run (§9). Established that a switch closes nothing, that one agy run is 23-48 tunnels each choosing its exit when it opens, and that a failed dial reaches the client as `EOF` after a `200` to CONNECT. Verified that the proxy username is parsed with no authentication configured, and a 16-bit wrap in url-test's tolerance comparison. | `IN-USER` pin rules and `tolerance: 5000` in `mihomo/config.yaml`; `GET /current` and a `pins:` status line in the rotator; `PROXY_CURRENT_PORT` in `.env`. |
+| 2026-09-07 | — | A single-node country that died mid-window kept the selector until the next switch (§6, "Leaving a dead country mid-window"). The rotator's window sleep became a 15 s watch that leaves a dead country at once; "dead" excludes nodes still awaiting their first check, so a node-list reload does not trip it. | `watch()`, `WATCH_SECONDS` and `Country.untested` / `is_dead` in `refresher/rotate.py`. |

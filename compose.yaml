@@ -67,8 +67,9 @@ services:
       start_period: 90s
 
   # Moves the live country every PROXY_ROTATION_SECONDS, so no exit IP faces the
-  # consumer's upstream long enough to be worth blocking. Same image as the refresher,
-  # different program.
+  # consumer's upstream long enough to be worth blocking -- and sooner, the moment the
+  # country in play has no live node left. Same image as the refresher, different
+  # program.
   #
   # It also answers GET /current on PROXY_CURRENT_PORT: the country a consumer names in
   # its proxy username to keep one unit of work on one exit (README, "Pinning"). It

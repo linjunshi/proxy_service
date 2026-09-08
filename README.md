@@ -19,7 +19,7 @@ Windows 127.0.0.1:1082            order_process containers
                   proxy_service ──── mixed port 1082 ─┬─ IN-USER,<country> ── that country's group
                         ▲   ▲                         └─ MATCH ── PROXY ─┬─ JP ── the 日本 node in play ── internet
                         │   │ PUT /proxies/PROXY                         ├─ US ── the 美国 node in play
-                        │   └──── proxy_rotator ── every 15 min, least recently used
+                        │   └──── proxy_rotator ── every 15 min, least recently used; sooner if it dies
                         │            (shares this container's network namespace, so the
                         │             control API stays on loopback; answers GET /current
                         │             on proxy_service:1083 — which country to pin to)
@@ -112,6 +112,14 @@ that is a round-robin; a country skipped for being dead keeps its place in the q
 rather than forfeiting its turn, which matters because several countries here are a
 single node.
 
+Between switches it keeps looking. Every 15 s it re-reads the core's health, and the
+moment the country in play has no live node left — its last node failed its check, or
+a list change took it away — it switches at once instead of letting a dead country
+serve out its window. A single-node country like `DE` has no other defence; a country
+with several nodes fails over inside itself first. The seconds after a node-list change,
+when every node is rebuilt with its checks still pending, do not read as dead, so a
+refresh never trips this.
+
 Inside the window the node is mihomo's job: the country's `url-test` group picks its
 fastest live node, stays on it until it dies, then moves to the next live node of the
 same country without waiting for the next switch. Staying put is `tolerance` in
@@ -187,8 +195,9 @@ verdict:   UP - HTTPS leaves through the tunnel
 - **`nodes: … published N min ago`** — a number climbing past `REFRESH_INTERVAL_SECONDS`
   means refresh cycles are failing; `make logs` says why, in one line per cycle.
 - **`live: JP 8/8 …`** — how many of each country's nodes answered their last health
-  check. A country at `0/n` is skipped rather than served; every country at `0` is why
-  a `verdict: DOWN` happened, and the rotator says so once per retry.
+  check. A country at `0/n` is skipped rather than served, and left within seconds if
+  it was the one serving; every country at `0` is why a `verdict: DOWN` happened, and
+  the rotator says so once per retry.
 - **`pins: JP US …`** — the countries a proxy username reaches. A country under
   `(no IN-USER rule for …)` has no line in `mihomo/config.yaml`, so a consumer naming it
   rotates with everyone else and cannot tell.
@@ -203,7 +212,8 @@ verdict:   UP - HTTPS leaves through the tunnel
 | `refresh failed: 0 node(s) match the region filter` | `PROXY_REGION_FILTER` matches nothing the provider currently sells | `make nodes` (old list), widen the filter, `make refresh` |
 | `proxy_service` unhealthy, `verdict: DOWN` | Every published node is dead, or `PROXY_PORT` disagrees with `mixed-port` | `make logs`; the `live:` line in `make status` says which countries still have anything |
 | `rotation held: no country has a live node (…)` | Nothing anywhere answered its health check. The rotator holds rather than parking a window on a dead country | Expected for the first minute after a start; past that, the provider or this host's egress is down |
-| `rotation held: … Connection refused` | The core is not listening yet, or was recreated under the rotator | Expected at boot; otherwise `make up` |
+| `DE 0/1 has no live node left after 212s; switching now` | The country in play lost its last node mid-window; the rotator moved on without waiting for the switch | Nothing. If one country does this every time it is chosen, its node is flapping: drop it from `PROXY_REGION_FILTER` |
+| `rotation held: … Connection refused`, or `cannot read the core mid-window (…)` | The core is not listening yet, or was recreated under the rotator | Expected at boot; otherwise `make up` |
 | `country: unreadable - is the rotator up, or pinned?` | `make pin` stopped the rotator, or it is crash-looping | `make up` to resume rotation, `make logs` if it is not that |
 | `no IN-USER rule pins X`, or `pins: … (no IN-USER rule for X)` | A member of `PROXY` has no tag rule, so a consumer that names it in its proxy username is not pinned | Add `- IN-USER,X,X` above `MATCH` in `mihomo/config.yaml`, then `make down` and `make up` so the core re-reads it |
 | `refusing to start: cannot listen on port 1083` | Something else in the core's network namespace holds `PROXY_CURRENT_PORT` | Change it in `.env`, `make up`; tell the consumer |

@@ -4,8 +4,9 @@
 The core has no time-window primitive: `url-test` ranks on latency and `load-balance`
 balances per connection, so "which country serves the next quarter hour" has to be
 decided from outside. This is that outside. It reads the health the core already
-measures, picks the least recently used country that still has a live node, and moves
-the PROXY selector there.
+measures, picks the least recently used country that still has a live node, moves the
+PROXY selector there, and keeps reading: a country whose last node dies mid-window is
+left within seconds, not at the next switch.
 
 It speaks to the control API from inside the core's own network namespace
 (compose.yaml, `network_mode: service:proxy_service`), which is why that API can stay
@@ -72,6 +73,12 @@ HTTP_TIMEOUT_SECONDS = 10
 # country has finished its first health check -- both resolve in seconds.
 RETRY_SECONDS = 15
 
+# How often the country in play is re-read mid-window, so a dead one serves for at most
+# this long past the moment the core knows. The core itself re-measures every node once
+# a minute (the health-check `interval` in mihomo/config.yaml), which is the real floor;
+# looking more often than this would buy little, and each look is two GETs on loopback.
+WATCH_SECONDS = 15
+
 
 class RotationError(Exception):
     """A cycle failed for a reason the operator can act on, with the cause named."""
@@ -114,13 +121,25 @@ class Country:
 
     name: str
     live: int
+    untested: int
     total: int
     node: str | None
 
     @property
     def is_eligible(self) -> bool:
-        """Serving from a country with no live node is a quarter hour of REJECT."""
+        """A destination needs a node known to answer: an empty group refuses every
+        connection, a dead one fails every dial, and an untested one may be either."""
         return self.live > 0
+
+    @property
+    def is_dead(self) -> bool:
+        """Every member has been checked and none answers, or there are none left.
+
+        Narrower than ineligible on purpose. A real change to the node list rebuilds
+        every node with no history, and until the checks land a few seconds later such
+        a country is unknown, not dead -- a reason to wait, not to leave.
+        """
+        return self.live == 0 and self.untested == 0
 
     def __str__(self) -> str:
         return f"{self.name} {self.live}/{self.total}"
@@ -191,28 +210,34 @@ def _nodes(providers: dict) -> dict[str, dict]:
 def _country(proxies: dict, nodes: dict, name: str) -> Country:
     group = proxies.get(name) or {}
     members = [member for member in group.get("all") or [] if member not in BUILTIN_OUTBOUNDS]
+    delays = [_last_delay(nodes.get(member)) for member in members]
     return Country(
         name=name,
-        live=sum(1 for member in members if _is_live(nodes.get(member))),
+        live=sum(1 for delay in delays if delay),
+        untested=delays.count(None),
         total=len(members),
         node=group.get("now"),
     )
 
 
-def _is_live(node: dict | None) -> bool:
-    """Live means a health check has completed and come back non-zero.
+def _last_delay(node: dict | None) -> int | None:
+    """What the node's last completed health check measured: its delay, 0 for a failure,
+    None while none has completed. Live is a delay above zero.
 
     A failure is recorded as delay 0, not as a missing entry, and the same check is
-    mirrored into `extra` under the URL it was made against -- read both, so a node
-    tested only under a group's own URL is not mistaken for one never tested. The
-    node's own `alive` flag is deliberately not trusted: it starts optimistic, and an
-    untested country is not one to hand a quarter of an hour.
+    mirrored into `extra` under the URL it was made against -- read both and take the
+    best, so a node tested only under a group's own URL is not mistaken for one never
+    tested. The node's own `alive` flag is deliberately not trusted: it starts
+    optimistic, and an untested country is not one to hand a quarter of an hour. A
+    member the providers do not report has no check coming, so it counts as failed
+    rather than as pending.
     """
     if not node:
-        return False
+        return 0
     histories = [node.get("history") or []]
     histories += [(entry or {}).get("history") or [] for entry in (node.get("extra") or {}).values()]
-    return any((history[-1].get("delay") or 0) > 0 for history in histories if history)
+    delays = [history[-1].get("delay") or 0 for history in histories if history]
+    return max(delays) if delays else None
 
 
 def missing_tag_rules(rules: dict, countries: list[Country]) -> list[str]:
@@ -234,8 +259,8 @@ def current(settings: Settings) -> dict[str, str | None]:
     selected, countries = survey(*_fetch(settings))
     if selected is None:
         raise RotationError(f"{SELECTOR_GROUP} has no country selected")
-    via = next((country.node for country in countries if country.name == selected), None)
-    return {"country": selected, "via": via}
+    serving = _country_named(countries, selected)
+    return {"country": selected, "via": serving.node if serving else None}
 
 
 def request_label(query: str) -> str | None:
@@ -253,6 +278,37 @@ def rotate(settings: Settings, rotation: Rotation) -> tuple[str, list[Country]]:
     if chosen != current:
         _select(settings, chosen)
     return chosen, countries
+
+
+def watch(settings: Settings, window_seconds: float) -> None:
+    """Wait out the window with an eye on the core, and cut it short the moment the
+    country in play is dead: every dial through it fails until the selector moves.
+
+    Every WATCH_SECONDS the core is read again. A country with a live node keeps its
+    window. One that is dead -- every node failed, or none left after a list change --
+    is left now. One whose checks are still pending is waited on, not left: see
+    Country.is_dead. A core that cannot be read is not a dead country, so the window
+    goes on, and the next cycle reports the outage if it is still there.
+    """
+    started = time.monotonic()
+    deadline = started + window_seconds
+    while (remaining := deadline - time.monotonic()) > 0:
+        time.sleep(min(WATCH_SECONDS, remaining))
+        try:
+            current, countries = survey(*_fetch(settings))
+        except RotationError as error:
+            LOG.warning("cannot read the core mid-window (%s); the window goes on", error)
+            continue
+        serving = _country_named(countries, current)
+        if serving is not None and not serving.is_dead:
+            continue
+        LOG.warning(
+            "%s has no live node left after %.0fs; switching now; %s",
+            serving if serving is not None else f"{SELECTOR_GROUP} with nothing selected",
+            time.monotonic() - started,
+            _tally(countries),
+        )
+        return
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -298,15 +354,16 @@ def main(argv: list[str] | None = None) -> int:
     while True:
         try:
             chosen, countries = rotate(settings, rotation)
-            if not verified:
-                _verify_tag_rules(settings, countries)
-                verified = True
-            delay = settings.next_window()
-            LOG.info("serving %s via %s; next switch in %.0fs; %s", chosen, _node(countries, chosen), delay, _tally(countries))
         except RotationError as error:
-            delay = RETRY_SECONDS
-            LOG.error("rotation held: %s; retrying in %ds", error, delay)
-        time.sleep(delay)
+            LOG.error("rotation held: %s; retrying in %ds", error, RETRY_SECONDS)
+            time.sleep(RETRY_SECONDS)
+            continue
+        if not verified:
+            _verify_tag_rules(settings, countries)
+            verified = True
+        window = settings.next_window()
+        LOG.info("serving %s via %s; next switch in %.0fs; %s", chosen, _node(countries, chosen), window, _tally(countries))
+        watch(settings, window)
 
 
 # ---- the one-shot modes ------------------------------------------------------------
@@ -328,7 +385,7 @@ def _report(settings: Settings) -> int:
 def _pin(settings: Settings, name: str) -> int:
     try:
         _, countries = survey(*_fetch(settings))
-        country = next((c for c in countries if c.name == name), None)
+        country = _country_named(countries, name)
         if country is None:
             raise RotationError(f"{name} is not a member of {SELECTOR_GROUP} ({_tally(countries)})")
         if not country.is_eligible:
@@ -427,7 +484,12 @@ def serve_current(settings: Settings) -> CurrentServer:
 
 
 def _node(countries: list[Country], name: str | None) -> str:
-    return next((country.node or "nothing" for country in countries if country.name == name), "nothing")
+    country = _country_named(countries, name)
+    return country.node if country and country.node else "nothing"
+
+
+def _country_named(countries: list[Country], name: str | None) -> Country | None:
+    return next((country for country in countries if country.name == name), None)
 
 
 # ---- the core's control API --------------------------------------------------------

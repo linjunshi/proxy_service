@@ -2,9 +2,10 @@
 the answer it gives consumers.
 
 The control-API edge is not tested: everything worth getting wrong there -- reading the
-core's health, and choosing from it -- is a pure function over the `/proxies` body.
-`/current` is driven over a real loopback socket instead, because what it promises a
-consumer is an HTTP answer.
+core's health, and choosing from it -- is a pure function over the `/proxies` body. The
+mid-window watch runs on a fake clock that moves only when it sleeps. `/current` is
+driven over a real loopback socket instead, because what it promises a consumer is an
+HTTP answer.
 
 Run: python3 -m unittest discover -s refresher
 """
@@ -68,6 +69,10 @@ class SurveyTest(unittest.TestCase):
         _, countries = rotate.survey(*snapshot(JP=[None, None]))
         self.assertEqual(countries[0].live, 0)
 
+    def test_counts_the_nodes_still_awaiting_their_first_check(self):
+        _, countries = rotate.survey(*snapshot(JP=[120, 0, None, None]))
+        self.assertEqual((countries[0].live, countries[0].untested, countries[0].total), (1, 2, 4))
+
     def test_a_country_whose_filter_matched_nothing_holds_no_members(self):
         _, countries = rotate.survey(*snapshot(DE=[]))
         self.assertEqual((countries[0].live, countries[0].total), (0, 0))
@@ -87,9 +92,10 @@ class SurveyTest(unittest.TestCase):
         }
         self.assertEqual(rotate.survey(groups, providers)[1][0].live, 1)
 
-    def test_a_node_the_providers_do_not_report_is_not_assumed_live(self):
+    def test_a_node_the_providers_do_not_report_is_neither_live_nor_awaiting_a_check(self):
         groups, _ = snapshot(JP=[120, 120])
-        self.assertEqual(rotate.survey(groups, {"providers": {}})[1][0].live, 0)
+        country = rotate.survey(groups, {"providers": {}})[1][0]
+        self.assertEqual((country.live, country.untested), (0, 0))
 
     def test_a_core_without_the_selector_group_is_refused(self):
         with self.assertRaisesRegex(rotate.RotationError, rotate.SELECTOR_GROUP):
@@ -98,6 +104,31 @@ class SurveyTest(unittest.TestCase):
     def test_a_body_that_is_not_a_proxy_map_is_refused(self):
         with self.assertRaises(rotate.RotationError):
             rotate.survey({"message": "unauthorized"}, {"providers": {}})
+
+
+class CountryTest(unittest.TestCase):
+    """Eligible is where the rotator may go; dead is what it leaves. A country whose
+    checks have not landed yet is neither, which is what keeps a node-list reload --
+    every node rebuilt with no history -- from reading as a dead country."""
+
+    def country(self, *delays: int | None) -> rotate.Country:
+        return rotate.survey(*snapshot(DE=list(delays)))[1][0]
+
+    def test_a_country_with_a_live_node_is_eligible(self):
+        country = self.country(0, 150)
+        self.assertEqual((country.is_eligible, country.is_dead), (True, False))
+
+    def test_a_country_whose_every_node_failed_is_dead(self):
+        country = self.country(0, 0)
+        self.assertEqual((country.is_eligible, country.is_dead), (False, True))
+
+    def test_a_country_with_no_node_left_is_dead(self):
+        country = self.country()
+        self.assertEqual((country.is_eligible, country.is_dead), (False, True))
+
+    def test_a_country_still_being_checked_is_neither(self):
+        country = self.country(0, None)
+        self.assertEqual((country.is_eligible, country.is_dead), (False, False))
 
 
 class RotationTest(unittest.TestCase):
@@ -201,6 +232,80 @@ class CycleTest(unittest.TestCase):
         chosen, call = self.cycle(snapshot(selected="JP", JP=[120], US=[0]))
         self.assertEqual(chosen, "JP")
         self.assertIsNone(call)
+
+    def test_a_dead_country_in_play_is_left_for_a_live_one(self):
+        chosen, call = self.cycle(snapshot(selected="DE", DE=[0], JP=[120]))
+        self.assertEqual(chosen, "JP")
+        self.assertEqual(call, mock.call(self.SETTINGS, "JP"))
+
+
+class Clock:
+    """A monotonic clock that moves only when something sleeps on it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
+    def monotonic(self) -> float:
+        return self.now
+
+
+class WatchTest(unittest.TestCase):
+    """The window is waited out with an eye on the core: a country that dies mid-window
+    is left within one look, and nothing else ends the window early."""
+
+    ALIVE = snapshot(selected="DE", DE=[150], JP=[120])
+    DEAD = snapshot(selected="DE", DE=[0], JP=[120])
+    GONE = snapshot(selected="DE", DE=[], JP=[120])
+    UNCHECKED = snapshot(selected="DE", DE=[None], JP=[None])
+
+    def watch(self, *answers, window: float = 900) -> float:
+        """One watch on a fake clock. Each answer is what the core gives one look, the
+        last one for every look after; an exception is raised as that look. Returns
+        how long the watch took."""
+        clock = Clock()
+        pending = list(answers)
+
+        def look(_settings):
+            answer = pending.pop(0) if len(pending) > 1 else pending[0]
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        with mock.patch.object(rotate.time, "sleep", clock.sleep), \
+                mock.patch.object(rotate.time, "monotonic", clock.monotonic), \
+                mock.patch.object(rotate, "_fetch", side_effect=look):
+            rotate.watch(settings(), window)
+        return clock.now
+
+    def test_a_live_country_serves_its_whole_window_to_the_second(self):
+        with self.assertNoLogs(rotate.LOG, level="WARNING"):
+            self.assertEqual(self.watch(self.ALIVE, window=100), 100)
+
+    def test_a_country_that_dies_is_left_within_one_look(self):
+        with self.assertLogs(rotate.LOG, level="WARNING") as logged:
+            elapsed = self.watch(self.ALIVE, self.ALIVE, self.DEAD)
+        self.assertEqual(elapsed, 3 * rotate.WATCH_SECONDS)
+        self.assertIn("DE 0/1 has no live node left after 45s; switching now; DE 0/1  JP 1/1", logged.output[0])
+
+    def test_a_country_whose_nodes_left_the_list_is_left_too(self):
+        with self.assertLogs(rotate.LOG, level="WARNING"):
+            self.assertEqual(self.watch(self.GONE), rotate.WATCH_SECONDS)
+
+    def test_a_country_awaiting_its_checks_is_waited_on_not_left(self):
+        # The seconds after a real change to the node list: every node rebuilt with no
+        # history, and the checks land before the next look.
+        with self.assertNoLogs(rotate.LOG, level="WARNING"):
+            self.assertEqual(self.watch(self.UNCHECKED, self.ALIVE), 900)
+
+    def test_a_core_that_cannot_be_read_does_not_end_the_window(self):
+        with self.assertLogs(rotate.LOG, level="WARNING") as logged:
+            elapsed = self.watch(rotate.RotationError("GET /proxies unreachable"), self.ALIVE)
+        self.assertEqual(elapsed, 900)
+        self.assertEqual(len(logged.output), 1)
+        self.assertIn("cannot read the core mid-window", logged.output[0])
 
 
 class SelectTest(unittest.TestCase):
