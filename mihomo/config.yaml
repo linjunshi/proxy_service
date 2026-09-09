@@ -1,0 +1,113 @@
+# The headless core. This file is the whole of the proxy's behaviour: the node list
+# beside it (providers/nodes.yaml) is written by the refresher and hot-reloaded.
+mixed-port: 1082
+allow-lan: true
+bind-address: '*'
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: true
+
+# Loopback only, so the control API is reachable from `docker compose exec` and from
+# nothing else. The secret (-secret, from MIHOMO_API_SECRET) is defence in depth, not
+# the boundary.
+external-controller: 127.0.0.1:9090
+
+profile:
+  # Never remember a manually selected node across restarts: the group's own health
+  # check is the only thing that should decide which node is live.
+  store-selected: false
+
+# No local resolver. Without TUN there is nothing to hijack, the mixed port receives
+# hostnames and hands them to the selected node, and a resolver we do not need is one
+# more thing that can answer wrongly.
+dns:
+  enable: false
+
+proxy-providers:
+  subscription:
+    type: file
+    path: ./providers/nodes.yaml
+    health-check:
+      enable: true
+      # A Google endpoint on purpose: the one consumer talks to Google, so a node that
+      # cannot reach it is useless to us however fast it answers something else.
+      url: https://www.gstatic.com/generate_204
+      interval: 60
+      # Test even while idle: the first request after a quiet hour must not be the
+      # thing that discovers the node died.
+      lazy: false
+
+proxy-groups:
+  # One group per country the rotator may park on. The `filter` is a fact about how
+  # the vendor names its nodes (CONTEXT.md §4, item 7), not a policy: *which* countries
+  # this deployment may use is PROXY_REGION_FILTER's job in .env. A group whose filter
+  # matched nothing holds only REJECT, which the rotator reads as "no live node" and
+  # skips -- so a country may be added to or removed from .env without touching this
+  # file, as long as its group is declared here.
+  #
+  # url-test inside the country, because the window must not outlive the node: when the
+  # one in play dies the group moves to the next node of the same country at once,
+  # rather than serving REJECT until the rotator's next switch. It makes no other move:
+  # see `tolerance` below.
+  #
+  # The anchor carries how a node is tested -- one decision, not six. To add a country,
+  # add a line.
+  - &country
+    name: JP
+    filter: 日本
+    type: url-test
+    use: [subscription]
+    url: https://www.gstatic.com/generate_204
+    interval: 60
+    # Stay on one node until it dies. The group switches only when another node beats
+    # the one in play by more than this, and none can: the health check gives up at 5 s.
+    # That is what lets a client pinned to this group (see `rules:`) keep one exit for a
+    # whole unit of work. The old 50 ms moved the exit about once a minute, and a 16-bit
+    # wrap in the core's comparison also jumped it onto an untested node after every
+    # change to the node list (CONTEXT.md §9).
+    tolerance: 5000
+    lazy: false
+    # See PROXY below: an empty group must refuse, never fall back to DIRECT.
+    empty-fallback: REJECT
+  - {<<: *country, name: US, filter: 美国}
+  - {<<: *country, name: TW, filter: 台湾|台灣|臺灣}
+  - {<<: *country, name: KR, filter: 韩国}
+  - {<<: *country, name: DE, filter: 德国}
+  - {<<: *country, name: IN, filter: 印度}
+
+  # What `rules:` points at, and the only thing the rotator writes: every
+  # PROXY_ROTATION_SECONDS it selects the least recently used country that still has a
+  # live node, so no exit IP faces the consumer's upstream long enough to be worth
+  # blocking. With store-selected false a restart leaves this on the first member until
+  # the rotator's first cycle, seconds later.
+  #
+  # The most important line in this file is the `empty-fallback: REJECT` on each country
+  # above. A group with no members falls back to COMPATIBLE, which is a DIRECT outbound:
+  # a missing, empty or unreadable node list would silently route every request out of
+  # the host's own address -- the exact failure that retired the previous stack. REJECT
+  # refuses instead, which also turns the container unhealthy rather than quietly
+  # serving the wrong exit.
+  - name: PROXY
+    type: select
+    proxies: [JP, US, TW, KR, DE, IN]
+
+# The pin. A client that puts a country's name in its proxy username -- for example
+# http://US:<request id>@proxy_service:1082 -- is routed to that country's group for as
+# long as it sends that name, while PROXY keeps rotating for everyone else. The core
+# reads that username even with no `authentication:` set, and never reads the password
+# (verified on v1.19.30), so untagged clients are unaffected and the password is free to
+# carry a request id. A country is three lines in this file, all under the same name:
+# its group above, its place in PROXY, and its tag here.
+#
+# No DIRECT anywhere: with the core up and every node dead, a request must fail rather
+# than leave from the host's own address, which is the whole reason this stack exists.
+rules:
+  - IN-USER,JP,JP
+  - IN-USER,US,US
+  - IN-USER,TW,TW
+  - IN-USER,KR,KR
+  - IN-USER,DE,DE
+  - IN-USER,IN,IN
+  - MATCH,PROXY

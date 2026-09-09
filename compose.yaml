@@ -1,54 +1,116 @@
 name: proxy-service
 
 services:
-  wmsxwd:
-    platform: linux/amd64
-    build:
-      context: .
+  # The tunnel. Upstream's own image, unmodified and pinned by digest; everything
+  # this deployment decides is in mihomo/config.yaml and in the node list beside it.
+  proxy_service:
+    image: metacubex/mihomo:v1.19.30@sha256:baf38d282b785d7037337676714a69e3fdd1f2d9bf748dfd25fce681a624ea74
+    container_name: proxy_service
     restart: unless-stopped
+    # mihomo fails to start when a provider's file is missing, so at first boot the
+    # node list must exist before the core does. On a later host reboot the list is
+    # already in the volume and this only costs a few seconds.
+    depends_on:
+      refresher:
+        condition: service_healthy
+    # -d puts the config outside root's 0700 home so the core can run unprivileged;
+    # an empty secret disables API authentication, which is what loopback-only wants.
+    command: ["-d", "/config", "-secret", "${MIHOMO_API_SECRET:-}"]
     user: "10000:10000"
-    cap_drop:
-      - ALL
-    security_opt:
-      - no-new-privileges:true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
     read_only: true
     tmpfs:
-      - /tmp:rw,nosuid,nodev,noexec,size=512m
-    shm_size: 512m
+      - /tmp:rw,nosuid,nodev,noexec,size=64m
     volumes:
-      - wmsxwd_home:/home/app
-    environment:
-      WMSXWD_GUI_PORT: ${WMSXWD_GUI_PORT:?not set - copy .env.example to .env}
-      WMSXWD_PROXY_PORT: ${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}
-      WMSXWD_AUTO_CONNECT: ${WMSXWD_AUTO_CONNECT:?not set - copy .env.example to .env}
-    secrets:
-      - vnc_password
+      - ./mihomo/config.yaml:/config/config.yaml:ro
+      # Read-only: only the refresher writes the node list, and saying so in the
+      # mount is cheaper than trusting it.
+      - proxy_nodes:/config/providers:ro
     ports:
-      - "127.0.0.1:${WMSXWD_GUI_PORT:?not set - copy .env.example to .env}:${WMSXWD_GUI_PORT:?not set - copy .env.example to .env}"
-      - "127.0.0.1:${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}:${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}"
-    networks:
-      - order_process
-    # Probed through the container's own service name (wmsxwd), not
-    # 127.0.0.1: that is the path peers use, so it also catches the app
-    # binding loopback only (LAN access off), which a loopback probe reports
-    # as healthy. A live tunnel is deliberately NOT probed -- a dead upstream
-    # node must not restart-loop the container. Use `make status` for that.
+      - "127.0.0.1:${PROXY_PORT:?not set - copy .env.example to .env}:${PROXY_PORT:?not set - copy .env.example to .env}"
+    networks: [order_process]
+    # End to end, through the proxy itself: healthy means the tunnel actually carries
+    # traffic to Google, not merely that a port is open. It also catches PROXY_PORT
+    # disagreeing with the mixed-port in mihomo/config.yaml. Plain HTTP because the
+    # image's busybox wget cannot CONNECT through a proxy; `make status` covers that.
     healthcheck:
       test:
         - CMD-SHELL
-        - >-
-          bash -ec 'exec 3<>/dev/tcp/wmsxwd/${WMSXWD_PROXY_PORT:?not set - copy .env.example to .env}; exec 3>&-'
-      interval: 15s
-      timeout: 3s
-      retries: 5
-      start_period: 60s
+        - http_proxy=http://127.0.0.1:${PROXY_PORT} wget -q -T 8 -O /dev/null -Y on http://www.gstatic.com/generate_204
+      interval: 30s
+      timeout: 12s
+      retries: 3
+      start_period: 30s
+
+  # Keeps the node list fresh. Deliberately NOT behind the proxy: the component that
+  # fetches the node list must not depend on the nodes it fetches.
+  refresher:
+    build: ./refresher
+    container_name: proxy_refresher
+    restart: unless-stopped
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    volumes:
+      - proxy_nodes:/providers
+    env_file: [.env]
+    networks: [order_process]
+    # Healthy once a node list exists; that is the precondition the core waits on.
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /providers/nodes.yaml"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+  # Moves the live country every PROXY_ROTATION_SECONDS, so no exit IP faces the
+  # consumer's upstream long enough to be worth blocking -- and sooner, the moment the
+  # country in play has no live node left. Same image as the refresher, different
+  # program.
+  #
+  # It also answers GET /current on PROXY_CURRENT_PORT: the country a consumer names in
+  # its proxy username to keep one unit of work on one exit (README, "Pinning"). It
+  # listens in the core's namespace, so consumers reach it at proxy_service:<port> and
+  # no `ports:` is needed here -- to expose it on the host, publish that port on
+  # proxy_service above, since this container cannot declare ports of its own.
+  rotator:
+    build: ./refresher
+    command: ["/app/rotate.py"]
+    container_name: proxy_rotator
+    restart: unless-stopped
+    # The core's control API is bound to 127.0.0.1 inside the core's own container.
+    # Sharing its network namespace is what reaches it without exposing 9090 to
+    # order_process, where the consumer stack also lives. There is no TUN, so this
+    # shares the core's network stack without putting the rotator behind the proxy.
+    #
+    # The cost: a container in another's namespace goes stale when that one is
+    # recreated. Always `make up`, never `docker restart proxy_service`.
+    network_mode: "service:proxy_service"
+    # Started, not healthy: the core is unhealthy exactly when the country in play is
+    # dead, which is the moment the rotator is needed most. It retries until the
+    # control API answers.
+    depends_on:
+      proxy_service:
+        condition: service_started
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    read_only: true
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    # Named rather than env_file: the rotator has no business holding the panel
+    # credential, and this is also the list of what it reads. Compose fills each from
+    # .env; an empty value means the program's own default.
+    environment:
+      PROXY_ROTATION_SECONDS: ${PROXY_ROTATION_SECONDS:-}
+      PROXY_ROTATION_JITTER_SECONDS: ${PROXY_ROTATION_JITTER_SECONDS:-}
+      PROXY_CURRENT_PORT: ${PROXY_CURRENT_PORT:-}
+      MIHOMO_API_SECRET: ${MIHOMO_API_SECRET:-}
 
 volumes:
-  wmsxwd_home:
-
-secrets:
-  vnc_password:
-    file: ${VNC_PASSWORD_FILE:?not set - copy .env.example to .env}
+  proxy_nodes:
 
 networks:
   order_process:
