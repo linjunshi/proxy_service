@@ -141,6 +141,7 @@ def select(
             raise RefreshError(
                 f"subscription body holds a proxy without {'/'.join(REQUIRED_PROXY_FIELDS)}: {entry!r}"
             )
+        LOG.info("fetched node: %s", entry["name"])
 
     kept = [
         proxy

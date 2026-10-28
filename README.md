@@ -222,6 +222,9 @@ verdict:   UP - HTTPS leaves through the tunnel
 A failed refresh cycle of any cause leaves the previous node list serving and logs how
 stale it now is. A dead panel costs staleness, never an outage.
 
+Each refresh logs every fetched node's full name on its own `fetched node:` line,
+including nodes excluded by the filters. The count summary shows how many are retained.
+
 ## Design decisions worth knowing before you change something
 
 - **Three decisions, three owners.** *Which nodes exist* is the refresher's
