@@ -45,6 +45,7 @@ Copy `.env.example` to `.env` (`make` does it for you) and fill in the account:
 | `PROXY_REGION_FILTER` | `台湾\|台灣\|臺灣\|Taiwan\|TW` | Regex over the node name; only matching nodes are published |
 | `PROXY_REGION_EXCLUDE` | unset | Optional regex; `×[2-9]` skips expensive traffic multipliers |
 | `PROXY_MIN_NODES` | `1` | Below this the refresher refuses to publish and keeps the list it has |
+| `PROXY_SERVER_MAP_URL` | Official app's `wm1xiaoyuan120.json` endpoint | Optional HTTPS override if the vendor moves its server-address map; fetched each refresh |
 | `PROXY_ROTATION_SECONDS` | `900` | How long one country serves before the rotator moves on. Minimum 60 |
 | `PROXY_ROTATION_JITTER_SECONDS` | `90` | Spread each switch over ±this, so the changeover is not a clean quarter hour. At most half the window; `0` disables |
 | `PROXY_CURRENT_PORT` | `1083` | The rotator's `GET /current`, inside the core's namespace: `proxy_service:1083` on `order_process`. Not published on the host |
@@ -212,7 +213,8 @@ verdict:   UP - HTTPS leaves through the tunnel
 | `refresh failed: … carries no proxies: list` | The subscription host answered a dialect we do not speak | Re-run the §"Re-verify" procedure in `CONTEXT.md` |
 | `refresh failed: 0 node(s) match the region filter` | `PROXY_REGION_FILTER` matches nothing the provider currently sells | `make nodes` (old list), widen the filter, `make refresh` |
 | `proxy_service` unhealthy, `verdict: DOWN` | Every published node is dead, or `PROXY_PORT` disagrees with `mixed-port` | `make logs`; the `live:` line in `make status` says which countries still have anything |
-| `rotation held: no country has a live node (…)` | Nothing anywhere answered its health check. The rotator holds rather than parking a window on a dead country | Expected for the first minute after a start; past that, the provider or this host's egress is down |
+| `rotation held: no country has a live node (…)` | No loaded country has a node that passed its health check. The rotator holds rather than parking a window on a dead country | Expected while initial tests run; if it persists, check the selected node names, server DNS, and this host's egress |
+| `connect error: dns resolve failed: couldn't find ip` | The core cannot resolve the proxy server named before `connect error`; the tunnel has not reached the test destination | Follow "Server DNS failures" below; changing the test URL cannot repair an unresolvable proxy server |
 | `DE 0/1 has no live node left after 212s; switching now` | The country in play lost its last node mid-window; the rotator moved on without waiting for the switch | Nothing. If one country does this every time it is chosen, its node is flapping: drop it from `PROXY_REGION_FILTER` |
 | `rotation held: … Connection refused`, or `cannot read the core mid-window (…)` | The core is not listening yet, or was recreated under the rotator | Expected at boot; otherwise `make up` |
 | `country: unreadable - is the rotator up, or pinned?` | `make pin` stopped the rotator, or it is crash-looping | `make up` to resume rotation, `make logs` if it is not that |
@@ -222,6 +224,37 @@ verdict:   UP - HTTPS leaves through the tunnel
 
 A failed refresh cycle of any cause leaves the previous node list serving and logs how
 stale it now is. A dead panel costs staleness, never an outage.
+
+### Server DNS failures
+
+In `www.gstatic.com:80 error: wm1jp.000.com:32067 ... dns resolve failed`, the failed
+lookup is for **`wm1jp.000.com`**, the proxy server. The HTTP request is Docker's
+end-to-end container check; the per-node latency checks use HTTPS. Both need a
+resolvable server before they can test the tunnel. With `dns.enable: false`, mihomo
+uses system DNS for that lookup ([mihomo DNS documentation](https://wiki.metacubex.one/en/config/dns/)).
+
+The official app obtains a separate address map for its `客户端` server aliases.
+These aliases may deliberately have no public DNS record. The refresher downloads
+that same map every cycle and substitutes its IP addresses before publishing, keeping
+the selected names, ports, credentials, and TLS server names. `server address:` log
+lines show each applied mapping. No change to the region filters is needed.
+
+If this error appears on an older deployment, deploy the updated refresher with
+`docker compose up -d --build` and check its mapping and publication logs. If a map
+download fails, its JSON is invalid, or a client-only hostname has no mapping, the
+cycle keeps the previous provider file and retries. An already-resolved client server
+IP needs no mapping. `PROXY_SERVER_MAP_URL` can follow an official endpoint change;
+the default comes from the 1.42.5 app's `campusNetwork` configuration. The refresher
+decodes the app's encrypted feed with the format constants distributed in that client;
+no new account credential or `.env` change is needed.
+
+On 2026-10-28, applying this map took the same five selected client-only nodes from
+0/5 to 5/5 passing, including `日本01-×1-客户端`, without changing the test URL.
+Google connectivity is necessary but does **not** prove that Gemini accepts an exit
+IP; verify that separately with the consuming application. Do not replace the chosen
+client nodes merely because other nodes pass a generic connectivity test.
+
+### Node and latency logs
 
 Each refresh logs two separate blocks: `FETCHED NODES` lists the full subscription
 with one full name per `fetched node:` line; `FILTERED NODES (KEPT)` lists the nodes

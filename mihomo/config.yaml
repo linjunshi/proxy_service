@@ -19,9 +19,9 @@ profile:
   # check is the only thing that should decide which node is live.
   store-selected: false
 
-# No local resolver. Without TUN there is nothing to hijack, the mixed port receives
-# hostnames and hands them to the selected node, and a resolver we do not need is one
-# more thing that can answer wrongly.
+# Explicit proxying needs no DNS listener. With DNS disabled, mihomo still resolves
+# the proxy server's own hostname through the container/system resolver before it can
+# open a tunnel. Destination hostnames are then handed to the selected node.
 dns:
   enable: false
 

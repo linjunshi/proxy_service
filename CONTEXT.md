@@ -80,8 +80,9 @@ procedure that reads them.
   an AES-encrypted list of candidate API hosts that it race-tests
   (`[ApiEndpointManager]`, `[AppConfigService]`). Five bootstrap URLs are baked in; one
   (`https://wtv18.oss-cn-shanghai.aliyuncs.com/v/v3421.json`) was live and returned
-  exactly the bundled `assets/data/c.dat`. The decryption key was not recovered **and is
-  not needed** — the panel base URL is simply the site the operator logs into.
+  exactly the bundled `assets/data/c.dat`. Decryption was not needed for the initial
+  panel integration. The 1.42.5 investigation later recovered the format constants to
+  identify its separate client-only server map (see §4).
 - It fetches the node list with `User-Agent: clash.meta/1.0` and feeds mihomo on stdin.
 
 Only the node-list fetch matters to us. Everything else the GUI added is a storefront.
@@ -102,6 +103,7 @@ established it. Measured 2026-09-03 against the live account with `panel_probe.p
 | 6 | The subscription endpoint always answers `Content-Type: text/html`; the body depends on how you ask | The dialect table below |
 | 7 | Node names are Chinese and carry a traffic multiplier, e.g. `台湾06-×1` | Region filtering and `PROXY_REGION_EXCLUDE` both key off the name |
 | 8 | **Every panel request must send a User-Agent.** The panel is behind Cloudflare, which answers `403` with body `error code: 1010` — a banned browser signature — to Python's default `Python-urllib/3.x`. Any other value passes, including an empty one. | Measured 2026-09-03: `curl` 200, `Python-urllib/3.12` 403, `clash.meta/1.0` 200 |
+| 9 | **Client-only server aliases need the app's separate address map.** The subscription does not include it. | Measured 2026-10-28: the app's `campusNetwork` feed supplies the addresses; applying it made all five selected client nodes pass unchanged HTTPS checks. See below. |
 
 Item 4 is the load-bearing fact: **the credential is the only durable secret**, which is
 why mihomo cannot simply point an `http` provider at a saved URL, and why the refresher
@@ -132,6 +134,61 @@ Account facts from the same run: `device_limit` 3, `alive_ip` 1, plan expiry
 2026-12-06, 20.9 GiB of 100 GiB used, `profile-update-interval` 24 hours. The refresher
 runs every 30 minutes anyway, because the host rotates faster than a day and a cycle
 costs one login and one download.
+
+### Client-only server addresses (measured 2026-10-28)
+
+The deployment reported `wm1jp.000.com:32067 ... dns resolve failed: couldn't find ip`
+and `JP 0/1 US 0/2`. Reproduced locally with the current `.env`: filter `客户端`,
+exclude `香港`. A successful fetch returned 41 proxies and selected five. The two
+Singapore nodes had no declared group; the three Japan/US nodes formed the reported
+basket. No `hosts` or `dns` section was present in the subscription.
+
+The three `wm1jp.000.com`, `wm1usa.888.com`, and `wm1sg.999.com` names returned NXDOMAIN
+through Google, Cloudflare, and AliDNS over HTTPS. The two AnyTLS server names returned
+a CNAME to `ts-mix-good.gym0boy.com` without an A record. Local system DNS instead
+returned synthetic `198.18.x.x` addresses, so a successful `getaddrinfo` alone was not
+proof of a usable server. All five selected nodes failed both the configured Google
+test and a Cloudflare test; an actual HTTPS CONNECT also failed.
+
+**Root cause: the subscription is not the official app's complete connection config.**
+The 1.42.5 app's encrypted `assets/data/c.dat` and live bootstrap configuration contain
+`campusNetwork: https://wmxos.oss-cn-shenzhen.aliyuncs.com/wma/wm1xiaoyuan120.json`.
+That endpoint returns base64-encoded AES-CBC with PKCS#7 padding, containing a JSON
+list of `{domain, targets, strategy, ip}` records. Its `ip` field supplies the selected address for each alias; for example,
+`wm1jp.000.com` mapped to `117.184.28.50` at diagnosis time. Public DNS was never the
+source for those aliases. The format's static key/IV were recovered from the distributed
+app binary and verified against both its bundled configuration and this live feed.
+`refresh.py` carries those format constants and uses pinned PyCryptodome to decode the
+map; they are not account credentials. HTTPS authenticates the download, while the
+decoder's schema checks validate its contents. A captured encrypted map, containing
+only public domain/address records, provides an offline format regression test.
+
+Applying the official mappings in an isolated core made **all five selected client
+nodes pass** the same Google test. Japan measured 148 ms and an actual HTTPS CONNECT
+returned 204; its exit IP was `172.234.86.113`. The refresher now fetches the address
+map each cycle and updates only each matched node's `server`, preserving its original
+TLS name where implicit. This retains the existing single-file atomic publication and
+hot reload, rather than generating and reloading a global DNS config. Invalid or
+unavailable maps, missing client-alias entries, and unsupported mapped transports
+fail the refresh before publication, keeping the last working file. Ordinary public
+hostnames and server IP literals need no override. The feed's `targets`/`strategy`
+are metadata; this integration consumes its explicit `ip`, not a new local selection
+algorithm. Unsupported plugins/non-TCP transports are rejected rather than guessing
+which additional host or TLS fields must be preserved.
+
+Changing core version, User-Agent, or adding the app's bootstrap relay did not fix the
+alias failures. The 1.42.5 package bundles mihomo 1.19.24, which failed with the bare
+subscription too. Regular Japan/US nodes passed generic HTTPS tests, but the user
+confirmed they were unsuitable for Gemini; the `客户端` filter and `香港` exclusion
+therefore remain unchanged. Connectivity health and Gemini's acceptance of an exit
+IP are separate checks. Keep the HTTPS test and validate the consumer independently.
+
+Final live verification: 97 tests passed during the sidecar build, all five original
+client nodes passed after publication, and the service became healthy. A real `agy`
+print request using `gemini-3.8-flash-low`, with its proxy username pinned to `JP`,
+returned the expected response in 15.8 s. Core logs confirmed `InUser(JP)` through
+`日本01-×1-客户端` for the Gemini API requests. Other nodes' Google checks do not by
+themselves establish Gemini acceptance.
 
 ### Where this can break silently
 
@@ -487,3 +544,4 @@ current code reports as `UNEXPECTED_EOF_WHILE_READING`.
 | 2026-09-04 | — | Country rotation built (§6). Two core behaviours measured that contradict the obvious assumption: provider nodes are absent from `/proxies`, and a group's `alive` flag stays true while every member is dead. A pre-existing crash in the refresher's HTTP error handling was found and fixed. Country populations measured at 日本 8, 美国 7, 台湾 6, 韩国 1, 德国 1, 印度 1. | `proxy_rotator` added; `mihomo/config.yaml` grew six country groups and a selector; `PROXY_ROTATION_SECONDS` and `PROXY_ROTATION_JITTER_SECONDS` added to `.env`. |
 | 2026-09-05 | — | Consumer requests failed when the rotator switched mid-run (§9). Established that a switch closes nothing, that one agy run is 23-48 tunnels each choosing its exit when it opens, and that a failed dial reaches the client as `EOF` after a `200` to CONNECT. Verified that the proxy username is parsed with no authentication configured, and a 16-bit wrap in url-test's tolerance comparison. | `IN-USER` pin rules and `tolerance: 5000` in `mihomo/config.yaml`; `GET /current` and a `pins:` status line in the rotator; `PROXY_CURRENT_PORT` in `.env`. |
 | 2026-09-07 | — | A single-node country that died mid-window kept the selector until the next switch (§6, "Leaving a dead country mid-window"). The rotator's window sleep became a 15 s watch that leaves a dead country at once; "dead" excludes nodes still awaiting their first check, so a node-list reload does not trip it. | `watch()`, `WATCH_SECONDS` and `Country.untested` / `is_dead` in `refresher/rotate.py`. |
+| 2026-10-28 | wmsxwd 1.42.5 | Client-only server aliases failed public DNS because the headless refresher omitted the app's separate encrypted address map (§4). | The refresher decodes and validates that map each cycle, preserves TLS names, and publishes the same selected nodes with current connection addresses. |

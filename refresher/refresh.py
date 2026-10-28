@@ -12,7 +12,9 @@ The contract with the vendor's API, and how to re-derive it, is in CONTEXT.md.
 
 from __future__ import annotations
 
+import base64
 import http.client
+import ipaddress
 import json
 import logging
 import os
@@ -26,6 +28,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import yaml
+from Crypto.Cipher import AES
+from Crypto.Util.Padding import unpad
 
 import env
 
@@ -51,6 +55,18 @@ HTTP_TIMEOUT_SECONDS = 30
 
 DEFAULT_REGION_FILTER = r"台湾|台灣|臺灣|Taiwan|TW"
 
+# The official app's `campusNetwork` feed supplies addresses for client-only server
+# aliases that do not exist in public DNS. This is separate from the subscription;
+# keep fetching it so a provider-side address change is part of an atomic refresh.
+# Source: wmsxwd 1.42.5 app configuration, verified 2026-10-28 (CONTEXT.md §4).
+DEFAULT_SERVER_MAP_URL = "https://wmxos.oss-cn-shenzhen.aliyuncs.com/wma/wm1xiaoyuan120.json"
+
+# Format constants distributed in the vendor's app, not account credentials. This
+# CBC envelope provides compatibility, not authenticity: the download must use HTTPS
+# and the decoded data must still pass the schema checks below.
+SERVER_MAP_KEY = bytes.fromhex("63724f7a42733544524f70422372794e7476495144617623716d5057614c7439")
+SERVER_MAP_IV = bytes.fromhex("2139492378217831596f4d5045415445")
+
 # Everything mihomo needs to instantiate a proxy. A body missing them is not the
 # dialect we pinned, and publishing it would break the provider rather than the node.
 REQUIRED_PROXY_FIELDS = ("name", "type", "server")
@@ -71,10 +87,15 @@ class Settings:
     interval_seconds: int
     retry_interval_seconds: int
     nodes_path: Path
+    server_map_url: str
 
     @staticmethod
     def from_env() -> Settings:
         """Read the whole configuration, or refuse to start naming what is missing."""
+        server_map_url = env.optional("PROXY_SERVER_MAP_URL", DEFAULT_SERVER_MAP_URL)
+        address = urllib.parse.urlsplit(server_map_url)
+        if address.scheme != "https" or not address.hostname:
+            raise ValueError("PROXY_SERVER_MAP_URL must be an absolute HTTPS URL")
         return Settings(
             panel_base_url=env.required("PANEL_BASE_URL").rstrip("/"),
             email=env.required("PANEL_EMAIL"),
@@ -85,6 +106,7 @@ class Settings:
             interval_seconds=env.whole_number("REFRESH_INTERVAL_SECONDS", 1800),
             retry_interval_seconds=env.whole_number("RETRY_INTERVAL_SECONDS", 300),
             nodes_path=Path(env.optional("NODES_PATH", "/providers/nodes.yaml")),
+            server_map_url=server_map_url,
         )
 
 
@@ -161,6 +183,81 @@ def select(
     return kept
 
 
+def apply_server_map(nodes: list[dict], document: bytes) -> list[dict]:
+    """Apply the official feed's selected `ip` for each server alias.
+
+    Preserve the node's identity, port, credentials, and TLS name. Rewriting just the
+    connection address lets the existing provider-file hot reload carry map updates,
+    without restarting the core or changing its global DNS configuration. Missing
+    mappings for client-only aliases fail the cycle; ordinary public hostnames and
+    already-resolved server addresses remain valid without an override.
+    """
+    try:
+        entries = json.loads(document)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        # The app feed is base64(AES-CBC(JSON + PKCS#7 padding)). Also accept plain
+        # JSON for an explicitly configured endpoint that has removed the envelope.
+        try:
+            ciphertext = base64.b64decode(document.strip(), validate=True)
+            plaintext = AES.new(SERVER_MAP_KEY, AES.MODE_CBC, SERVER_MAP_IV).decrypt(ciphertext)
+            entries = json.loads(unpad(plaintext, AES.block_size))
+        except ValueError as error:
+            raise RefreshError("server address map has invalid JSON or app encryption") from error
+    if not isinstance(entries, list):
+        raise RefreshError("server address map must be a list")
+    addresses = {}
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict) or not isinstance(entry.get("domain"), str) \
+                or not isinstance(entry.get("ip"), str):
+            raise RefreshError(f"server address map entry {index + 1} needs domain/ip strings")
+        domain = entry["domain"].rstrip(".").lower()
+        if len(domain) > 253 or any(
+            not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", label) for label in domain.split(".")
+        ):
+            raise RefreshError(f"server address map entry {index + 1} has an invalid domain")
+        try:
+            address = str(ipaddress.ip_address(entry["ip"]))
+        except ValueError as error:
+            raise RefreshError(f"server address map entry {index + 1} has an invalid IP address") from error
+        if domain in addresses:
+            raise RefreshError(f"server address map entry {index + 1} repeats a domain")
+        addresses[domain] = address
+
+    # These protocols default the TLS name to `server`. Keep that default's original
+    # value when substituting an IP, including when the subscription spells it as "".
+    tls_names = {"anytls": "sni", "trojan": "sni", "hysteria": "sni", "hysteria2": "sni",
+                 "tuic": "sni", "vmess": "servername", "vless": "servername"}
+    resolved = []
+    for node in nodes:
+        server = node["server"]
+        name = str(node["name"]).replace("\r", r"\r").replace("\n", r"\n")
+        if not isinstance(server, str):
+            raise RefreshError(f"node {name!r} has a non-string server")
+        address = addresses.get(server.rstrip(".").lower())
+        if address is None:
+            if "客户端" in str(node["name"]):
+                try:
+                    ipaddress.ip_address(server)
+                except ValueError as error:
+                    raise RefreshError(f"client node {name!r} has no server mapping -- refusing to publish") from error
+            resolved.append(node)
+            continue
+        kind = node["type"]
+        if not isinstance(kind, str) or (kind not in tls_names and kind != "ss") or (kind == "ss" and node.get("plugin")) \
+                or node.get("network", "tcp") not in ("tcp", ""):
+            raise RefreshError(f"cannot preserve connection settings when mapping node {name!r}: unsupported protocol/plugin/transport")
+        mapped = {**node, "server": address}
+        if kind in tls_names:
+            field = tls_names[kind]
+            if mapped.get(field) is not None and not isinstance(mapped[field], str):
+                raise RefreshError(f"node {name!r} has an invalid TLS server name")
+            if not mapped.get(field):
+                mapped[field] = server
+        resolved.append(mapped)
+        LOG.info("server address: %s | %s -> %s", name, server, address)
+    return resolved
+
+
 def publish(nodes: list[dict], path: Path) -> None:
     """Replace the node list in one step: mihomo must never read a half-written file."""
     document = yaml.safe_dump(
@@ -187,6 +284,8 @@ def refresh(settings: Settings) -> int:
             f"{len(nodes)} node(s) match the region filter, below PROXY_MIN_NODES="
             f"{settings.min_nodes} -- refusing to publish a shorter list than the one serving"
         )
+    LOG.info("fetching server address map %s", _public(settings.server_map_url))
+    nodes = apply_server_map(nodes, _get(settings.server_map_url, headers={"User-Agent": SUBSCRIPTION_USER_AGENT}))
     publish(nodes, settings.nodes_path)
     return len(nodes)
 
