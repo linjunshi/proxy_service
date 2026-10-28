@@ -43,9 +43,9 @@ proxy-groups:
   # One group per country the rotator may park on. The `filter` is a fact about how
   # the vendor names its nodes (CONTEXT.md §4, item 7), not a policy: *which* countries
   # this deployment may use is PROXY_REGION_FILTER's job in .env. A group whose filter
-  # matched nothing holds only REJECT, which the rotator reads as "no live node" and
-  # skips -- so a country may be added to or removed from .env without touching this
-  # file, as long as its group is declared here.
+  # matched nothing holds only REJECT, which the rotator skips and omits from its
+  # loaded-basket summary -- so a country may be added to or removed from .env
+  # without touching this file, as long as its group is declared here.
   #
   # url-test inside the country, because the window must not outlive the node: when the
   # one in play dies the group moves to the next node of the same country at once,
@@ -73,6 +73,7 @@ proxy-groups:
     empty-fallback: REJECT
   - {<<: *country, name: US, filter: 美国}
   - {<<: *country, name: TW, filter: 台湾|台灣|臺灣}
+  - {<<: *country, name: HK, filter: 香港|Hong Kong|HK}
   - {<<: *country, name: KR, filter: 韩国}
   - {<<: *country, name: DE, filter: 德国}
   - {<<: *country, name: IN, filter: 印度}
@@ -91,7 +92,7 @@ proxy-groups:
   # serving the wrong exit.
   - name: PROXY
     type: select
-    proxies: [JP, US, TW, KR, DE, IN]
+    proxies: [JP, US, TW, HK, KR, DE, IN]
 
 # The pin. A client that puts a country's name in its proxy username -- for example
 # http://US:<request id>@proxy_service:1082 -- is routed to that country's group for as
@@ -107,6 +108,7 @@ rules:
   - IN-USER,JP,JP
   - IN-USER,US,US
   - IN-USER,TW,TW
+  - IN-USER,HK,HK
   - IN-USER,KR,KR
   - IN-USER,DE,DE
   - IN-USER,IN,IN

@@ -34,7 +34,7 @@ rotate:
 
 # Hold one country -- `make pin C=US` -- until `make up` puts the rotator back.
 pin:
-	@test -n "$(C)" || { echo "usage: make pin C=<JP|US|TW|KR|DE|IN>"; exit 2; }
+	@test -n "$(C)" || { echo "usage: make pin C=<country group from make status>"; exit 2; }
 	docker compose stop rotator
 	docker compose run --rm rotator /app/rotate.py --pin $(C)
 

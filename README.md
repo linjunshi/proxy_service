@@ -105,7 +105,7 @@ of riding the rotation — see "Pinning one unit of work to one exit" below.
 ## Rotating between countries
 
 The nodes the refresher publishes are grouped by country in `mihomo/config.yaml` — one
-`url-test` group each for `JP US TW KR DE IN` — and `PROXY` is a plain selector over
+`url-test` group each for `JP US TW HK KR DE IN` — and `PROXY` is a plain selector over
 them. `proxy_rotator` moves that selector every `PROXY_ROTATION_SECONDS`, picking the
 **least recently used country that still has a live node**. With every country healthy
 that is a round-robin; a country skipped for being dead keeps its place in the queue
@@ -133,7 +133,7 @@ Two limits worth knowing:
   answer to one you have observed, and `make pin C=US` parks the tunnel while you look.
 - **Which countries exist is `mihomo/config.yaml`'s list; which are populated is
   `PROXY_REGION_FILTER`'s.** A group whose filter matches no published node holds only
-  `REJECT`, reads as `0/0` in `make status`, and is skipped — so a country can be added
+  `REJECT` and is omitted from the logged basket and `make status` — so a country can be added
   to or dropped from `.env` without touching the core's config, as long as its group is
   declared there. Adding a country the config does not know needs three lines: its
   group, its name in `PROXY`'s `proxies:`, and its `IN-USER` rule.
@@ -195,10 +195,11 @@ verdict:   UP - HTTPS leaves through the tunnel
 - **`nodes: … published N min ago`** — a number climbing past `REFRESH_INTERVAL_SECONDS`
   means refresh cycles are failing; `make logs` says why, in one line per cycle.
 - **`live: JP 8/8 …`** — how many of each country's nodes answered their last health
-  check. A country at `0/n` is skipped rather than served, and left within seconds if
+  check, for countries with loaded nodes. Empty groups are omitted; a populated
+  country at `0/n` stays visible and is skipped rather than served, and left within seconds if
   it was the one serving; every country at `0` is why a `verdict: DOWN` happened, and
   the rotator says so once per retry.
-- **`pins: JP US …`** — the countries a proxy username reaches. A country under
+- **`pins: JP US …`** — the populated countries a proxy username reaches. A country under
   `(no IN-USER rule for …)` has no line in `mihomo/config.yaml`, so a consumer naming it
   rotates with everyone else and cannot tell.
 
@@ -222,8 +223,28 @@ verdict:   UP - HTTPS leaves through the tunnel
 A failed refresh cycle of any cause leaves the previous node list serving and logs how
 stale it now is. A dead panel costs staleness, never an outage.
 
-Each refresh logs every fetched node's full name on its own `fetched node:` line,
-including nodes excluded by the filters. The count summary shows how many are retained.
+Each refresh logs two separate blocks: `FETCHED NODES` lists the full subscription
+with one full name per `fetched node:` line; `FILTERED NODES (KEPT)` lists the nodes
+that passed both the region and exclusion filters, one per `filtered node:` line.
+Each block has a count and an end marker, including when no nodes pass the filters.
+The later `published` message confirms that the filtered list was saved successfully.
+
+The rotator logs latency results for the published nodes in separate `LATENCY CHECKS`
+blocks. Each row includes the full node name and either `PASS` with milliseconds,
+`FAILED` when the check returned no usable latency, or `PENDING` before its first
+completed check. Completed results include the core's test timestamp. These are
+mihomo's existing health checks, observed every 15 seconds; unchanged samples are
+not repeated, and a new test is logged even when its latency stays the same.
+The block footer counts the updated results in that block. Nodes excluded by the
+refresher are not loaded into mihomo and have no latency results here.
+
+```text
+========== LATENCY CHECKS | subscription | 3 updated node(s) ==========
+PASS    | 123 ms | 台湾01-×0.3-客户端 | tested 2026-10-28T02:40:00Z
+FAILED  | no usable latency | 美国01-×1-客户端 | tested 2026-10-28T02:40:00Z
+PENDING | awaiting first test | 日本01-×0.3
+========== END LATENCY CHECKS | 1 passed | 1 failed | 1 pending ==========
+```
 
 ## Design decisions worth knowing before you change something
 
@@ -270,8 +291,14 @@ If the new filter matches nothing, the refresher refuses to publish and the old 
 keeps serving — so a typo costs a log line, not the tunnel.
 
 Removing a country from the filter needs no change in `mihomo/config.yaml`: its group
-goes to `0/0` and the rotator stops choosing it. *Adding* one the config has never
-heard of does — copy a `- {<<: *country, …}` line into `proxy-groups`, add its name to
+becomes empty, disappears from the logged basket, and the rotator stops choosing it.
+Hong Kong is supported by the `HK` group: including `香港` in `PROXY_REGION_FILTER`
+loads matching nodes into that group and makes it appear in the summary and pin list.
+The `fetched node:` log lists the full subscription before filtering, so seeing an HK
+name there alone does not mean it was included in the published provider.
+
+For a country not yet declared in the config, copy a `- {<<: *country, …}` line into
+`proxy-groups`, add its name to
 `PROXY`'s `proxies:`, and add its `- IN-USER,<name>,<name>` line above `MATCH`.
 
 ## Updating the core

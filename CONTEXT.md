@@ -329,6 +329,21 @@ next cycle usually worked. It defeated the documented intent that "a dead panel 
 staleness, never an outage", and re-logged in on every crash. Both sidecars now catch
 `(OSError, http.client.HTTPException)`, and `TransportTest` in each test file pins it.
 
+### Reporting the loaded basket (2026-10-28)
+
+The summary previously printed every declared group, including empty placeholders.
+It now reports only groups with loaded nodes, while keeping populated groups whose
+checks all failed visible as `0/n`. The `pins:` line follows the same loaded set;
+rotation eligibility and fail-closed handling of empty groups are unchanged.
+
+Including Hong Kong nodes also exposed a configuration omission: there was no `HK`
+group, selector member, or pin rule. All three are now declared in `mihomo/config.yaml`.
+The refresher's region filter still controls whether HK nodes are published. A fetched
+node name is not evidence that it passed those filters. Other undeclared regions
+still require a group, selector member, and pin rule; the rotator does not infer
+routable groups from provider names. Verified HK grouping, selection, pinning and
+summary output against the actual mihomo core with an isolated fixture provider.
+
 ## 7. What the core was measured to do (2026-09-03, local, mihomo v1.19.30)
 
 These four behaviours shaped `mihomo/config.yaml` and `compose.yaml`. Re-check them

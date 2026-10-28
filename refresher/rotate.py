@@ -177,6 +177,66 @@ class Rotation:
         return chosen
 
 
+class LatencyLog:
+    """Report changed health-check samples once, using the rotator's existing polls.
+
+    The core mirrors each provider check into `extra[testUrl]`. Prefer that history
+    and fall back to the primary one, so one test produces one row. Keep only the
+    current provider members: a removed node must not leave an ever-growing cache.
+    """
+
+    def __init__(self) -> None:
+        self._seen: dict[tuple[str, str], tuple[str | None, int | None]] = {}
+
+    def report(self, providers: dict) -> None:
+        observed = {}
+        for provider_name, provider in (providers.get("providers") or {}).items():
+            # Compatible providers are the core's synthetic groups/built-ins.
+            if not isinstance(provider, dict) or provider.get("vehicleType") == "Compatible":
+                continue
+            rows = []
+            for node in provider.get("proxies") or []:
+                if not isinstance(node, dict) or not isinstance(node.get("name"), str):
+                    continue
+                name = node["name"]
+                history = ((node.get("extra") or {}).get(provider.get("testUrl")) or {}).get("history")
+                history = history or node.get("history") or []
+                if not history:
+                    sample = (None, None)
+                else:
+                    latest = history[-1]
+                    if not isinstance(latest, dict) or not isinstance(latest.get("time"), str) \
+                            or not latest["time"] or type(latest.get("delay")) is not int or latest["delay"] < 0:
+                        LOG.warning("cannot report latency for %s: invalid health-check sample", _log_label(name))
+                        continue
+                    sample = (latest["time"], latest["delay"])
+                key = (provider_name, name)
+                observed[key] = sample
+                if key not in self._seen or self._seen[key] != sample:
+                    rows.append((name, *sample))
+            if not rows:
+                continue
+            LOG.info("========== LATENCY CHECKS | %s | %d updated node(s) ==========", _log_label(provider_name), len(rows))
+            passed = failed = pending = 0
+            for name, checked_at, delay in rows:
+                if delay is None:
+                    pending += 1
+                    LOG.info("PENDING | awaiting first test | %s", _log_label(name))
+                elif delay == 0:
+                    failed += 1
+                    LOG.info("FAILED  | no usable latency | %s | tested %s", _log_label(name), _log_label(checked_at))
+                else:
+                    passed += 1
+                    LOG.info("PASS    | %d ms | %s | tested %s", delay, _log_label(name), _log_label(checked_at))
+            LOG.info("========== END LATENCY CHECKS | %d passed | %d failed | %d pending ==========", passed, failed, pending)
+        self._seen = observed
+
+
+def _log_label(value: str) -> str:
+    """Keep externally supplied names/timestamps on one physical log line."""
+    return value.replace("\r", r"\r").replace("\n", r"\n")
+
+
 def survey(groups: dict, providers: dict) -> tuple[str | None, list[Country]]:
     """Read the selector group and the health of every country it can reach.
 
@@ -271,16 +331,19 @@ def request_label(query: str) -> str | None:
     return values[0] if REQUEST_ID.fullmatch(values[0]) else "a malformed request id"
 
 
-def rotate(settings: Settings, rotation: Rotation) -> tuple[str, list[Country]]:
+def rotate(settings: Settings, rotation: Rotation, latency_log: LatencyLog | None = None) -> tuple[str, list[Country]]:
     """Run one cycle: survey, choose, and move the selector if the choice moved."""
-    current, countries = survey(*_fetch(settings))
+    groups, providers = _fetch(settings)
+    if latency_log is not None:
+        latency_log.report(providers)
+    current, countries = survey(groups, providers)
     chosen = rotation.next(countries, current)
     if chosen != current:
         _select(settings, chosen)
     return chosen, countries
 
 
-def watch(settings: Settings, window_seconds: float) -> None:
+def watch(settings: Settings, window_seconds: float, latency_log: LatencyLog | None = None) -> None:
     """Wait out the window with an eye on the core, and cut it short the moment the
     country in play is dead: every dial through it fails until the selector moves.
 
@@ -295,7 +358,10 @@ def watch(settings: Settings, window_seconds: float) -> None:
     while (remaining := deadline - time.monotonic()) > 0:
         time.sleep(min(WATCH_SECONDS, remaining))
         try:
-            current, countries = survey(*_fetch(settings))
+            groups, providers = _fetch(settings)
+            if latency_log is not None:
+                latency_log.report(providers)
+            current, countries = survey(groups, providers)
         except RotationError as error:
             LOG.warning("cannot read the core mid-window (%s); the window goes on", error)
             continue
@@ -350,10 +416,11 @@ def main(argv: list[str] | None = None) -> int:
     LOG.info("answering GET %s on port %d", CURRENT_PATH, settings.current_port)
 
     rotation = Rotation()
+    latency_log = LatencyLog()
     verified = False
     while True:
         try:
-            chosen, countries = rotate(settings, rotation)
+            chosen, countries = rotate(settings, rotation, latency_log)
         except RotationError as error:
             LOG.error("rotation held: %s; retrying in %ds", error, RETRY_SECONDS)
             time.sleep(RETRY_SECONDS)
@@ -363,7 +430,7 @@ def main(argv: list[str] | None = None) -> int:
             verified = True
         window = settings.next_window()
         LOG.info("serving %s via %s; next switch in %.0fs; %s", chosen, _node(countries, chosen), window, _tally(countries))
-        watch(settings, window)
+        watch(settings, window, latency_log)
 
 
 # ---- the one-shot modes ------------------------------------------------------------
@@ -399,16 +466,20 @@ def _pin(settings: Settings, name: str) -> int:
 
 
 def _tally(countries: list[Country]) -> str:
-    return "  ".join(str(country) for country in countries)
+    """The loaded basket, including failed checks but excluding empty placeholders."""
+    return "  ".join(str(country) for country in countries if country.total) or "none (no nodes loaded)"
 
 
 def _pins(settings: Settings, countries: list[Country]) -> str:
     """The countries a proxy username reaches, and the ones the core's rules leave out."""
+    countries = [country for country in countries if country.total]
+    if not countries:
+        return "none (no nodes loaded)"
     try:
         missing = missing_tag_rules(_json(settings, "/rules"), countries)
     except RotationError as error:
         return f"unreadable ({error})"
-    pinned = " ".join(country.name for country in countries if country.name not in missing)
+    pinned = " ".join(country.name for country in countries if country.name not in missing) or "none"
     return pinned + (f"  (no IN-USER rule for {' '.join(missing)})" if missing else "")
 
 
@@ -421,7 +492,7 @@ def _verify_tag_rules(settings: Settings, countries: list[Country]) -> None:
         LOG.error("could not read the core's rules to check the pin tags: %s", error)
         return
     if not missing:
-        LOG.info("every member of %s has its IN-USER rule: %s", SELECTOR_GROUP, " ".join(c.name for c in countries))
+        LOG.info("every configured member of %s has its IN-USER rule", SELECTOR_GROUP)
     for name in missing:
         LOG.error(
             "no IN-USER rule pins %s: a client naming it rotates with everyone else -- add "

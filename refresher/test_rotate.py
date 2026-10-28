@@ -106,6 +106,113 @@ class SurveyTest(unittest.TestCase):
             rotate.survey({"message": "unauthorized"}, {"providers": {}})
 
 
+class LatencyLogTest(unittest.TestCase):
+    URL = "https://www.gstatic.com/generate_204"
+    TIME = "2026-10-28T02:40:00Z"
+
+    def setUp(self):
+        self.reporter = rotate.LatencyLog()
+
+    def providers(self, *nodes):
+        return {"providers": {"subscription": {
+            "vehicleType": "File", "testUrl": self.URL, "proxies": list(nodes),
+        }}}
+
+    def node(self, name="台湾01-×0.3-客户端", delay=123, time=TIME):
+        return {"name": name, "history": [] if delay is None else [{"time": time, "delay": delay}]}
+
+    def test_full_names_and_failed_or_pending_results_are_distinct(self):
+        with self.assertLogs(rotate.LOG, level="INFO") as logged:
+            self.reporter.report(self.providers(
+                self.node(), self.node("美国01-×1-客户端", 0), self.node("日本01-×0.3", None),
+            ))
+        output = "\n".join(logged.output)
+        self.assertIn("PASS    | 123 ms | 台湾01-×0.3-客户端", output)
+        self.assertIn("FAILED  | no usable latency | 美国01-×1-客户端", output)
+        self.assertIn("PENDING | awaiting first test | 日本01-×0.3", output)
+        self.assertIn("tested " + self.TIME, output)
+        self.assertIn("LATENCY CHECKS | subscription | 3 updated node(s)", logged.output[0])
+        self.assertIn("END LATENCY CHECKS | 1 passed | 1 failed | 1 pending", logged.output[-1])
+
+    def test_repeated_poll_is_silent_but_a_new_test_with_the_same_delay_is_logged(self):
+        providers = self.providers(self.node())
+        self.reporter.report(providers)
+        with self.assertNoLogs(rotate.LOG):
+            self.reporter.report(providers)
+        with self.assertLogs(rotate.LOG) as logged:
+            self.reporter.report(self.providers(self.node(time="2026-10-28T02:41:00Z")))
+        self.assertIn("123 ms", "\n".join(logged.output))
+
+    def test_url_history_is_authoritative_and_not_double_counted(self):
+        node = self.node()
+        node["extra"] = {self.URL: {"history": [{"time": "2026-10-28T02:41:00Z", "delay": 0}]}}
+        with self.assertLogs(rotate.LOG) as logged:
+            self.reporter.report(self.providers(node))
+        self.assertEqual(sum("FAILED " in line for line in logged.output), 1)
+        self.assertFalse(any("PASS " in line for line in logged.output))
+
+    def test_reload_returns_to_pending_and_removed_nodes_are_forgotten(self):
+        self.reporter.report(self.providers(self.node()))
+        with self.assertLogs(rotate.LOG) as logged:
+            self.reporter.report(self.providers(self.node(delay=None)))
+        self.assertIn("PENDING", "\n".join(logged.output))
+        self.reporter.report(self.providers())
+        with self.assertLogs(rotate.LOG) as logged:
+            self.reporter.report(self.providers(self.node()))
+        self.assertIn("PASS ", "\n".join(logged.output))
+
+    def test_synthetic_groups_are_not_reported_as_nodes(self):
+        providers = self.providers(self.node("PROXY"))
+        providers["providers"]["subscription"]["vehicleType"] = "Compatible"
+        with self.assertNoLogs(rotate.LOG):
+            self.reporter.report(providers)
+
+    def test_invalid_samples_are_reported_without_interrupting_rotation(self):
+        for invalid in ("123", -1, True):
+            with self.subTest(delay=invalid), self.assertLogs(rotate.LOG, level="WARNING") as logged:
+                self.reporter.report(self.providers(self.node(delay=invalid)))
+            self.assertIn("invalid health-check sample", logged.output[0])
+
+    def test_node_name_cannot_forge_an_extra_log_line(self):
+        with self.assertLogs(rotate.LOG) as logged:
+            self.reporter.report(self.providers(self.node("台湾01\r\nforged")))
+        row = logged.output[1]
+        self.assertIn(r"台湾01\r\nforged", row)
+        self.assertEqual(len(row.splitlines()), 1)
+
+    def test_rotation_logs_checks_even_when_no_country_is_eligible(self):
+        groups, providers = snapshot(selected="TW", TW=[0])
+        providers["providers"]["subscription"]["proxies"][0]["history"][0]["time"] = self.TIME
+        with mock.patch.object(rotate, "_fetch", return_value=(groups, providers)), \
+                self.assertLogs(rotate.LOG) as logged, self.assertRaises(rotate.RotationError):
+            rotate.rotate(settings(), rotate.Rotation(), self.reporter)
+        self.assertIn("FAILED  | no usable latency | TW01", "\n".join(logged.output))
+
+
+class BasketLogTest(unittest.TestCase):
+    def test_summary_follows_populated_groups_including_hong_kong(self):
+        _, countries = rotate.survey(*snapshot(JP=[], US=[120], HK=[90, 0]))
+        self.assertEqual(rotate._tally(countries), "US 1/1  HK 1/2")
+
+    def test_a_populated_but_dead_group_stays_visible(self):
+        _, countries = rotate.survey(*snapshot(JP=[], HK=[0, 0]))
+        self.assertEqual(rotate._tally(countries), "HK 0/2")
+
+    def test_an_empty_basket_has_an_explicit_message(self):
+        _, countries = rotate.survey(*snapshot(JP=[], HK=[]))
+        self.assertEqual(rotate._tally(countries), "none (no nodes loaded)")
+
+    def test_status_pin_list_follows_populated_groups(self):
+        _, countries = rotate.survey(*snapshot(JP=[], US=[120], HK=[90]))
+        rules = {"rules": [{"type": "InUser", "payload": name, "proxy": name} for name in ("JP", "US", "HK")]}
+        with mock.patch.object(rotate, "_json", return_value=rules):
+            self.assertEqual(rotate._pins(settings(), countries), "US HK")
+
+    def test_empty_basket_does_not_report_placeholder_pin_targets(self):
+        _, countries = rotate.survey(*snapshot(JP=[], HK=[]))
+        self.assertEqual(rotate._pins(settings(), countries), "none (no nodes loaded)")
+
+
 class CountryTest(unittest.TestCase):
     """Eligible is where the rotator may go; dead is what it leaves. A country whose
     checks have not landed yet is neither, which is what keeps a node-list reload --
@@ -238,6 +345,11 @@ class CycleTest(unittest.TestCase):
         self.assertEqual(chosen, "JP")
         self.assertEqual(call, mock.call(self.SETTINGS, "JP"))
 
+    def test_an_included_hong_kong_group_can_be_selected(self):
+        chosen, call = self.cycle(snapshot(selected="US", JP=[], US=[0], HK=[90]))
+        self.assertEqual(chosen, "HK")
+        self.assertEqual(call, mock.call(self.SETTINGS, "HK"))
+
 
 class Clock:
     """A monotonic clock that moves only when something sleeps on it."""
@@ -307,6 +419,18 @@ class WatchTest(unittest.TestCase):
         self.assertEqual(len(logged.output), 1)
         self.assertIn("cannot read the core mid-window", logged.output[0])
 
+    def test_latency_results_are_logged_mid_window_without_additional_requests(self):
+        groups, providers = snapshot(selected="TW", TW=[120])
+        providers["providers"]["subscription"]["proxies"][0]["history"][0]["time"] = "2026-10-28T02:40:00Z"
+        clock = Clock()
+        with mock.patch.object(rotate.time, "sleep", clock.sleep), \
+                mock.patch.object(rotate.time, "monotonic", clock.monotonic), \
+                mock.patch.object(rotate, "_fetch", return_value=(groups, providers)) as fetch, \
+                self.assertLogs(rotate.LOG) as logged:
+            rotate.watch(settings(), 2 * rotate.WATCH_SECONDS, rotate.LatencyLog())
+        self.assertEqual(fetch.call_count, 2)
+        self.assertEqual(sum("PASS    | 120 ms | TW01" in line for line in logged.output), 1)
+
 
 class SelectTest(unittest.TestCase):
     def test_the_selector_group_is_moved_by_name(self):
@@ -364,7 +488,7 @@ class TagRulesTest(unittest.TestCase):
         with mock.patch.object(rotate, "_json", return_value=self.rules(("JP", "JP"), ("US", "US"))), \
                 self.assertLogs(rotate.LOG, level="INFO") as logged:
             rotate._verify_tag_rules(settings(), self.countries)
-        self.assertIn("every member of PROXY has its IN-USER rule: JP US", logged.output[0])
+        self.assertIn("every configured member of PROXY has its IN-USER rule", logged.output[0])
         with mock.patch.object(rotate, "_json", return_value=self.rules(("JP", "JP"))), \
                 self.assertLogs(rotate.LOG, level="ERROR") as logged:
             rotate._verify_tag_rules(settings(), self.countries)

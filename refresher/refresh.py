@@ -141,7 +141,6 @@ def select(
             raise RefreshError(
                 f"subscription body holds a proxy without {'/'.join(REQUIRED_PROXY_FIELDS)}: {entry!r}"
             )
-        LOG.info("fetched node: %s", entry["name"])
 
     kept = [
         proxy
@@ -149,6 +148,15 @@ def select(
         if region_filter.search(str(proxy["name"]))
         and not (region_exclude and region_exclude.search(str(proxy["name"])))
     ]
+    for title, label, nodes in (
+        ("FETCHED NODES", "fetched", proxies),
+        ("FILTERED NODES (KEPT)", "filtered", kept),
+    ):
+        LOG.info("========== %s | %d node(s) ==========", title, len(nodes))
+        for proxy in nodes:
+            name = str(proxy["name"]).replace("\r", r"\r").replace("\n", r"\n")
+            LOG.info("%s node: %s", label, name)
+        LOG.info("========== END %s ==========", title)
     LOG.info("%d of %d proxies match the region filter", len(kept), len(proxies))
     return kept
 
