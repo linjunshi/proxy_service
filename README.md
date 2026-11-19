@@ -256,6 +256,12 @@ client nodes merely because other nodes pass a generic connectivity test.
 
 ### Node and latency logs
 
+WMS 1.45.1's complete feed requires `User-Agent: wmsxwd142` without a `flag`
+parameter. The refresher decodes the native Shadowsocks, Trojan, AnyTLS and VLESS
+links into mihomo YAML, then applies the existing region filters and server map.
+The old Clash request returned 29 nodes. The native feed returned all 35 account
+nodes, including eight `客户端` entries, during verification on 2026-11-19.
+
 Each refresh logs two separate blocks: `FETCHED NODES` lists the full subscription
 with one full name per `fetched node:` line; `FILTERED NODES (KEPT)` lists the nodes
 that passed both the region and exclusion filters, one per `filtered node:` line.

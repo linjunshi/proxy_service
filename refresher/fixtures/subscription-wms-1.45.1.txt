@@ -1,0 +1,4 @@
+trojan://test-password@tw.example.invalid:443?allowInsecure=1&pcs=&peer=certificate.example.invalid&sni=certificate.example.invalid&type=tcp#台湾01-×0.3
+ss://MjAyMi1ibGFrZTMtYWVzLTEyOC1nY206QUFFQ0F3UUZCZ2NJQ1FvTERBME9Edz09OkVCRVNFeFFWRmhjWUdSb2JIQjBlSHc9PQ@wm1jp.000.com:32067#日本01-×1-客户端
+anytls://test-password@us.example.invalid:443?fp=chrome&hpkp=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef&insecure=1&pcs=&sni=tls.example.invalid&type=tcp#美国05-×1-客户端
+vless://00000000-0000-4000-8000-000000000001@ws.example.invalid:443?encryption=none&fp=chrome&headerType=none&host=cdn.example.invalid&insecure=0&path=%2Fsocket%3Fed%3D2048&quicSecurity=none&security=tls&sni=tls.example.invalid&type=ws#协议测试节点

@@ -1,8 +1,7 @@
 """Tests for the parts of the refresher that decide what reaches mihomo.
 
-The fixtures beside this file mirror the three bodies the subscription host is known
-to return (CONTEXT.md, "The dialect table"). Two of them are the ones that must never
-be published: publishing either would leave the core with no usable provider.
+Fixtures cover the native WMS feed, legacy Clash YAML and rejected documents.
+The base64 error fixture contains an incomplete VMess record.
 
 Run: python3 -m unittest discover -s refresher
 """
@@ -10,6 +9,7 @@ Run: python3 -m unittest discover -s refresher
 from __future__ import annotations
 
 import http.client
+import base64
 import json
 import os
 import re
@@ -52,7 +52,7 @@ class SelectTest(unittest.TestCase):
     def test_a_filter_that_matches_nothing_yields_nothing(self):
         self.assertEqual(refresh.select(body("subscription-clash-meta.yaml"), re.compile("火星"), None), [])
 
-    def test_the_base64_dialect_is_refused(self):
+    def test_an_unsupported_incomplete_uri_feed_is_refused(self):
         with self.assertRaises(refresh.RefreshError):
             refresh.select(body("subscription-base64.txt"), TAIWAN, None)
 
@@ -200,17 +200,63 @@ class ServerMapTest(unittest.TestCase):
 
 
 class DialectTest(unittest.TestCase):
-    def test_flag_is_pinned_even_when_the_panel_supplies_one(self):
+    def test_generic_export_flag_is_removed_if_the_panel_supplies_one(self):
         self.assertEqual(
-            refresh._with_flag("https://wm1855.example.invalid/w/wm?token=abc&flag=mihomo", "clash.meta"),
-            "https://wm1855.example.invalid/w/wm?token=abc&flag=clash.meta",
+            refresh._without_flag("https://wm1855.example.invalid/w/wm?token=abc&flag=clash.meta"),
+            "https://wm1855.example.invalid/w/wm?token=abc",
         )
 
-    def test_flag_is_added_when_the_panel_supplies_none(self):
+    def test_native_subscription_query_is_preserved_exactly(self):
+        url = "https://sub.example.invalid/w/wm?token=a%2Fb%2b&sign=first+second&empty="
         self.assertEqual(
-            refresh._with_flag("http://139.162.80.238:3690/w/wm?token=abc", "clash.meta"),
-            "http://139.162.80.238:3690/w/wm?token=abc&flag=clash.meta",
+            refresh._without_flag(url), url,
         )
+
+
+class NativeFeedTest(unittest.TestCase):
+    def test_complete_native_feed_reaches_the_published_provider(self):
+        names = ["台湾01-×0.3", "日本01-×1-客户端", "美国05-×1-客户端", "协议测试节点"]
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+            "PANEL_BASE_URL": "https://panel.example.invalid",
+            "PANEL_EMAIL": "me@example.invalid", "PANEL_PASSWORD": "test-password",
+            "NODES_PATH": str(Path(directory) / "nodes.yaml"), "PROXY_REGION_FILTER": ".*",
+        }, clear=True):
+            settings = refresh.Settings.from_env()
+            responses = [
+                b'{"data":{"auth_data":"account-token"}}',
+                b'{"data":{"subscribe_url":"https://sub.example.invalid/w/wm?token=user&flag=clash.meta"}}',
+                base64.b64encode(body("subscription-wms-1.45.1.txt")),
+                json.dumps([{"domain": "wm1jp.000.com", "ip": "192.0.2.1"},
+                            {"domain": "us.example.invalid", "ip": "192.0.2.2"}]).encode(),
+            ]
+            with mock.patch.object(refresh, "_get", side_effect=responses) as request:
+                self.assertEqual(refresh.refresh(settings), 4)
+            download = request.call_args_list[2]
+            self.assertEqual(download.args, ("https://sub.example.invalid/w/wm?token=user",))
+            self.assertEqual(download.kwargs["headers"], {"User-Agent": "wmsxwd142"})
+            nodes = yaml.safe_load(settings.nodes_path.read_bytes())["proxies"]
+            self.assertEqual([n["name"] for n in nodes], names)
+            self.assertEqual([n["type"] for n in nodes], ["trojan", "ss", "anytls", "vless"])
+            self.assertEqual(nodes[1]["server"], "192.0.2.1")
+            self.assertEqual(nodes[1]["password"], "AAECAwQFBgcICQoLDA0ODw==:EBESExQVFhcYGRobHB0eHw==")
+            self.assertEqual(nodes[2]["sni"], "tls.example.invalid")
+
+    def test_unsupported_native_entry_keeps_the_previous_provider(self):
+        document = body("subscription-wms-1.45.1.txt") + b"\nnewprotocol://SECRET@host:443#new"
+        with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
+            "PANEL_BASE_URL": "https://panel.example.invalid",
+            "PANEL_EMAIL": "me@example.invalid", "PANEL_PASSWORD": "test-password",
+            "NODES_PATH": str(Path(directory) / "nodes.yaml"),
+        }, clear=True):
+            settings = refresh.Settings.from_env()
+            settings.nodes_path.write_bytes(b"previous provider")
+            with mock.patch.object(refresh, "login", return_value="account-token"), \
+                    mock.patch.object(refresh, "subscription", return_value="https://sub.example.invalid/w/wm"), \
+                    mock.patch.object(refresh, "fetch_nodes", return_value=base64.b64encode(document)):
+                with self.assertRaises(refresh.RefreshError) as raised:
+                    refresh.refresh(settings)
+            self.assertNotIn("SECRET", str(raised.exception))
+            self.assertEqual(settings.nodes_path.read_bytes(), b"previous provider")
 
 
 class PanelHeaderTest(unittest.TestCase):

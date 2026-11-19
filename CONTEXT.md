@@ -192,16 +192,37 @@ themselves establish Gemini acceptance.
 
 ### Where this can break silently
 
-The dialect pin is the one that fails without a symptom: if the row yielding the
-largest Clash list moves to a different flag or User-Agent, the refresher keeps
-publishing — just a smaller or wrong-format list. Two guards catch it:
-`select()` refuses a body with no `proxies:` list, and `PROXY_MIN_NODES` refuses a
-shrunken one. Both leave the previous list serving and say so in the log.
+The requested format and user agent can select a smaller list. The parser rejects
+invalid YAML and unsupported native URI entries. `PROXY_MIN_NODES` rejects a
+selected count below its configured threshold. Compare the account inventory when
+re-verifying the format, since a valid smaller feed can pass both checks.
 
 TLS verification stays on for both the panel and the rotating host. If the vendor ever
 serves the subscription from a host with an untrusted certificate, every cycle will
 fail loudly rather than accept an injected node list — a node list is code as far as
 this stack is concerned, and an attacker who supplies one sees all the traffic.
+
+### Native subscription in WMS 1.45.1 (2026-11-19)
+
+The app's bundled `assets/data/c.dat` specifies `customUserAgent: wmsxwd142`.
+With that user agent and no format flag, the account-issued subscription URL
+returns a base64 URI list containing all 35 nodes in account-catalog order,
+including eight `客户端` names. The generic `flag=clash.meta` request returns
+29, even with the packaged user agent. The bundled extra header is unnecessary
+for the tested account.
+
+Login and `getSubscribe` keep their previous shapes. `subscription.py` converts
+the four observed protocols to mihomo YAML, preserving SS2022's two identity
+keys, TLS names and pins, and WebSocket settings. The existing address-map step
+resolves the client aliases. An invalid or unsupported URI fails the refresh
+before publication. Legacy Clash YAML remains supported.
+
+All 35 profiles loaded in an isolated mihomo v1.19.30 instance. Live HTTPS checks
+passed for 21, failed twice for 13, and completed HTTPS with unavailable egress
+confirmation for one. Four of the six recovered nodes passed in both headless
+and official-client checks. `日本05-×1-客户端` and `美国05-×1-客户端` failed
+in both. Availability varied during testing. The deployment's existing filter
+`0` selected 34 nodes and excluded `协议测试节点`.
 
 ## 5. Re-verify after a vendor update
 
@@ -227,53 +248,39 @@ strings -n 8 opt/wmsxwd/lib/libapp.so | grep -oE "https?://[a-zA-Z0-9._/?=&%-]+"
 strings -n 6 opt/wmsxwd/lib/AtlasCore_amd64 | grep -E "^1\.[0-9]+\.[0-9]+$"
 ```
 
-### 5.2 Against the live account — this is what actually matters
+### 5.2 Against the live account
 
-Run it inside the refresher, which already holds the credentials and PyYAML. Nothing to
-install, no secret to copy anywhere, and it exercises the same code path the sidecar
-uses. Self-contained on purpose: the scratch scripts an earlier investigation used are
-not in this repo.
+Run the current request and parser inside the refresher, and compare the raw
+subscription names with the authenticated account inventory.
 
 ```sh
-docker compose exec -T refresher python - <<'PY'
-import json, os, re, urllib.parse, urllib.request, yaml
+docker compose exec -T refresher python - <<'PYTHON'
+import re, sys
+from collections import Counter
+sys.path.insert(0, "/app")
+import refresh
 
-base = os.environ["PANEL_BASE_URL"].rstrip("/")
-form = urllib.parse.urlencode({"email": os.environ["PANEL_EMAIL"],
-                               "password": os.environ["PANEL_PASSWORD"]}).encode()
-# A User-Agent is mandatory -- contract item 8.
-head = {"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "clash.meta/1.0"}
-auth = json.load(urllib.request.urlopen(
-    urllib.request.Request(base + "/api/v1/passport/auth/login", data=form, headers=head), timeout=20
-))["data"]["auth_data"]
-
-sub = json.load(urllib.request.urlopen(urllib.request.Request(
-    base + "/api/v1/user/getSubscribe",
-    headers={"Authorization": auth, "User-Agent": "clash.meta/1.0"}), timeout=20
-))["data"]["subscribe_url"]
-print("subscription host:", sub.split("?")[0])   # run twice, hours apart: it rotates
-
-region = re.compile(os.environ["PROXY_REGION_FILTER"])
-for flag, ua in [("clash.meta", "clash.meta/1.0"), ("meta", None), (None, "clash.meta/1.0"),
-                 ("clash", "ClashforWindows/0.20.39"), ("mihomo", "mihomo/1.19.30"), (None, None)]:
-    body = urllib.request.urlopen(urllib.request.Request(
-        sub + (f"&flag={flag}" if flag else ""),
-        headers={"User-Agent": ua or "curl/8.7.1"}), timeout=30).read()
-    doc = yaml.safe_load(body)
-    if isinstance(doc, dict) and isinstance(doc.get("proxies"), list):
-        kept = [p for p in doc["proxies"] if region.search(p["name"])]
-        print(f"  {flag or '-':<12} {ua or 'curl/8.7.1':<26} "
-              f"{len(doc['proxies']):3d} proxies, {len(kept):3d} match the filter")
-    else:
-        print(f"  {flag or '-':<12} {ua or 'curl/8.7.1':<26} not Clash YAML")
-PY
+settings = refresh.Settings.from_env()
+auth = refresh.login(settings)
+catalog = refresh._request_json(
+    settings.panel_base_url + "/api/v1/user/server/fetch",
+    headers=refresh._panel_headers({"Authorization": auth}),
+)["data"]
+nodes = refresh.select(
+    refresh.fetch_nodes(refresh.subscription(settings, auth)),
+    re.compile(".*"), None,
+)
+expected = Counter(row["name"] for row in catalog)
+actual = Counter(node["name"] for node in nodes)
+print("Catalog", len(catalog), "subscription", len(nodes))
+print("Missing", list((expected - actual).elements()))
+print("Extra", list((actual - expected).elements()))
+PYTHON
 ```
 
-**If the combination yielding the largest Clash proxy list is no longer
-`flag=clash.meta` + `clash.meta/1.0`, change `SUBSCRIPTION_FLAG` and
-`SUBSCRIPTION_USER_AGENT` in `refresher/refresh.py` to match**, and record the new
-table in §4. That breakage is the silent one: the refresher would keep publishing, just
-a smaller or wrong-format list.
+Use a fresh subscription URL for each probe. After a package update, verify its
+user agent and native feed format before changing the request. Keep account
+tokens and raw connection profiles out of diagnostics.
 
 ## 6. Country rotation (2026-09-04)
 
@@ -545,3 +552,4 @@ current code reports as `UNEXPECTED_EOF_WHILE_READING`.
 | 2026-09-05 | — | Consumer requests failed when the rotator switched mid-run (§9). Established that a switch closes nothing, that one agy run is 23-48 tunnels each choosing its exit when it opens, and that a failed dial reaches the client as `EOF` after a `200` to CONNECT. Verified that the proxy username is parsed with no authentication configured, and a 16-bit wrap in url-test's tolerance comparison. | `IN-USER` pin rules and `tolerance: 5000` in `mihomo/config.yaml`; `GET /current` and a `pins:` status line in the rotator; `PROXY_CURRENT_PORT` in `.env`. |
 | 2026-09-07 | — | A single-node country that died mid-window kept the selector until the next switch (§6, "Leaving a dead country mid-window"). The rotator's window sleep became a 15 s watch that leaves a dead country at once; "dead" excludes nodes still awaiting their first check, so a node-list reload does not trip it. | `watch()`, `WATCH_SECONDS` and `Country.untested` / `is_dead` in `refresher/rotate.py`. |
 | 2026-10-28 | wmsxwd 1.42.5 | Client-only server aliases failed public DNS because the headless refresher omitted the app's separate encrypted address map (§4). | The refresher decodes and validates that map each cycle, preserves TLS names, and publishes the same selected nodes with current connection addresses. |
+| 2026-11-19 | wmsxwd 1.45.1 | The generic Clash request omitted six account nodes. | Use the packaged user agent without a format flag and decode the complete native URI feed (§4). |

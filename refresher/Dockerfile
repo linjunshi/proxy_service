@@ -31,7 +31,7 @@ RUN pip install --no-cache-dir "pyyaml==${PYYAML_VERSION}" "pycryptodome==${PYCR
 # is the only way this non-root process can write to it.
     && install -d -o refresher -g refresher /providers
 
-COPY --from=test /src/env.py /src/refresh.py /src/rotate.py /app/
+COPY --from=test /src/env.py /src/refresh.py /src/rotate.py /src/subscription.py /app/
 
 ENV PYTHONDONTWRITEBYTECODE=1
 

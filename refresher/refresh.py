@@ -3,7 +3,7 @@
 
 The subscription URL rotates its host every few hours, so the account credential is
 the only durable secret: every cycle logs in, asks the panel where the list lives
-today, downloads it in the pinned dialect and republishes it atomically. A cycle that
+today, downloads its native URI feed and publishes mihomo YAML atomically. A cycle that
 cannot do all of that leaves the previous list serving -- a dead panel costs
 staleness, never an outage.
 
@@ -32,21 +32,18 @@ from Crypto.Cipher import AES
 from Crypto.Util.Padding import unpad
 
 import env
+import subscription as native_subscription
 
 LOG = logging.getLogger("refresher")
 
-# The subscription host answers every dialect on one URL and picks by flag and
-# User-Agent. This pair is the one that yields the full Clash proxy list; the default
-# must never be relied on, because an unset flag plus mihomo's own User-Agent selects
-# a base64 URI list instead. See CONTEXT.md "The dialect table".
-SUBSCRIPTION_FLAG = "clash.meta"
-SUBSCRIPTION_USER_AGENT = "clash.meta/1.0"
+# WMS 1.45.1's bundled customUserAgent selects its complete native URI feed.
+# Adding flag=clash.meta selects a smaller YAML export, even with this user agent.
+SUBSCRIPTION_USER_AGENT = "wmsxwd142"
 
 # The panel sits behind Cloudflare, which answers `error code: 1010` -- a banned browser
 # signature -- to urllib's default User-Agent. Any other value passes; this one is what
 # the vendor's own client sends to its own API, so it is the least likely to be banned
-# next. It happens to equal SUBSCRIPTION_USER_AGENT and is not the same decision: that
-# one pins a dialect and may have to move, this one only has to not look like a bot.
+# next. The native subscription uses its own client identifier above.
 PANEL_USER_AGENT = "clash.meta/1.0"
 
 # Long enough for a slow rotating host, short enough that a hung fetch cannot outlive
@@ -131,8 +128,8 @@ def subscription(settings: Settings, auth: str) -> str:
 
 
 def fetch_nodes(subscribe_url: str) -> bytes:
-    """Download the node list, pinning the dialect by flag *and* User-Agent."""
-    url = _with_flag(subscribe_url, SUBSCRIPTION_FLAG)
+    """Request the complete native feed with a freshly issued subscription URL."""
+    url = _without_flag(subscribe_url)
     LOG.info("fetching %s", _public(url))
     return _get(url, headers={"User-Agent": SUBSCRIPTION_USER_AGENT})
 
@@ -142,22 +139,27 @@ def select(
     region_filter: re.Pattern[str],
     region_exclude: re.Pattern[str] | None,
 ) -> list[dict]:
-    """Parse a Clash subscription body and keep the proxies this deployment may use.
+    """Parse native WMS URIs or Clash YAML and apply the deployment's region filters.
 
-    Raises RefreshError when the body is not a Clash proxy list -- which is equally
-    what a base64 node list, an HTML error page and a lapsed plan look like.
+    Invalid or unsupported entries fail the entire refresh.
     """
     try:
         parsed = yaml.safe_load(document)
     except yaml.YAMLError as error:
         raise RefreshError(f"subscription body is not YAML: {error}") from error
 
-    if not isinstance(parsed, dict) or not isinstance(parsed.get("proxies"), list):
+    if isinstance(parsed, str):
+        try:
+            proxies = native_subscription.parse_uris(document)
+        except native_subscription.SubscriptionError as error:
+            raise RefreshError(str(error)) from error
+    elif isinstance(parsed, dict) and isinstance(parsed.get("proxies"), list):
+        proxies = parsed["proxies"]
+    else:
         raise RefreshError(
             "subscription body carries no `proxies:` list -- wrong dialect, or an error page"
         )
 
-    proxies = parsed["proxies"]
     for entry in proxies:
         if not isinstance(entry, dict) or any(not entry.get(field) for field in REQUIRED_PROXY_FIELDS):
             raise RefreshError(
@@ -370,11 +372,12 @@ def _field(body: dict, *path: str) -> str:
     return node
 
 
-def _with_flag(subscribe_url: str, flag: str) -> str:
+def _without_flag(subscribe_url: str) -> str:
     parts = urllib.parse.urlsplit(subscribe_url)
-    query = [pair for pair in urllib.parse.parse_qsl(parts.query, keep_blank_values=True) if pair[0] != "flag"]
-    query.append(("flag", flag))
-    return urllib.parse.urlunsplit(parts._replace(query=urllib.parse.urlencode(query)))
+    # Preserve encoded account tokens and signatures byte for byte.
+    query = [part for part in parts.query.split("&")
+             if urllib.parse.unquote_plus(part.partition("=")[0]) != "flag"]
+    return urllib.parse.urlunsplit(parts._replace(query="&".join(query)))
 
 
 def _public(url: str) -> str:
