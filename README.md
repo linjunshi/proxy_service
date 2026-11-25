@@ -59,7 +59,9 @@ change both together. The mistake is not silent — the healthcheck fetches *thr
 `PROXY_PORT` from inside the core's own container, so a disagreement turns
 `proxy_service` unhealthy within 30 s.
 
-`order_process` must already exist (`docker network inspect order_process`).
+`make up` creates the external `order_process` network automatically if it does not
+already exist; if running `docker compose up -d` directly on a new host, ensure
+`docker network inspect order_process` succeeds first.
 
 ## Run
 
@@ -257,10 +259,11 @@ client nodes merely because other nodes pass a generic connectivity test.
 ### Node and latency logs
 
 WMS 1.45.1's complete feed requires `User-Agent: wmsxwd142` without a `flag`
-parameter. The refresher decodes the native Shadowsocks, Trojan, AnyTLS and VLESS
-links into mihomo YAML, then applies the existing region filters and server map.
-The old Clash request returned 29 nodes. The native feed returned all 35 account
-nodes, including eight `客户端` entries, during verification on 2026-11-19.
+parameter. The refresher decodes the native Shadowsocks, Trojan, AnyTLS, VLESS,
+VMess, Hysteria2 (`hy2`) and TUIC links into mihomo YAML, then applies the
+existing region filters and server map. The old Clash request omits client-only
+entries; the native feed returned all 39 account nodes on 2026-11-25, including
+the `vmess://` WebSocket entry (`美国01-×0.5`) and `客户端` nodes.
 
 Each refresh logs two separate blocks: `FETCHED NODES` lists the full subscription
 with one full name per `fetched node:` line; `FILTERED NODES (KEPT)` lists the nodes

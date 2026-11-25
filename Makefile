@@ -13,6 +13,8 @@ build:
 	docker compose build
 
 up:
+	@chmod a+r mihomo/config.yaml
+	@docker network inspect order_process >/dev/null 2>&1 || docker network create order_process >/dev/null
 	docker compose up -d
 
 down:

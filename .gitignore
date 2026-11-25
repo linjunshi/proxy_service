@@ -4,6 +4,8 @@
 state/
 vendor/*
 !vendor/README.md
+*.deb
+*.rpm
 implementation_plan.md
 __pycache__/
 

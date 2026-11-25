@@ -29,9 +29,11 @@ RUN pip install --no-cache-dir "pyyaml==${PYYAML_VERSION}" "pycryptodome==${PYCR
     && useradd --uid "${APP_UID}" --gid "${APP_GID}" --no-create-home --shell /usr/sbin/nologin refresher \
 # A fresh named volume inherits the ownership of the image directory it covers, which
 # is the only way this non-root process can write to it.
+    && install -d -m 0755 /app \
     && install -d -o refresher -g refresher /providers
 
-COPY --from=test /src/env.py /src/refresh.py /src/rotate.py /src/subscription.py /app/
+COPY --from=test --chmod=0644 /src/env.py /src/subscription.py /app/
+COPY --from=test --chmod=0755 /src/refresh.py /src/rotate.py /app/
 
 ENV PYTHONDONTWRITEBYTECODE=1
 

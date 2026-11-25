@@ -66,6 +66,7 @@ services:
       timeout: 5s
       retries: 3
       start_period: 90s
+      start_interval: 3s
 
   # Moves the live country every PROXY_ROTATION_SECONDS, so no exit IP faces the
   # consumer's upstream long enough to be worth blocking -- and sooner, the moment the

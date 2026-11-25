@@ -211,11 +211,34 @@ including eight `客户端` names. The generic `flag=clash.meta` request returns
 29, even with the packaged user agent. The bundled extra header is unnecessary
 for the tested account.
 
-Login and `getSubscribe` keep their previous shapes. `subscription.py` converts
-the four observed protocols to mihomo YAML, preserving SS2022's two identity
-keys, TLS names and pins, and WebSocket settings. The existing address-map step
-resolves the client aliases. An invalid or unsupported URI fails the refresh
-before publication. Legacy Clash YAML remains supported.
+Login and `getSubscribe` keep their previous shapes (`panelType: v3board` in
+1.45.1's `c.dat` / `v3451.json`, with `https://api.wmsxwd-3.men` and
+`https://ali.xiajunhuagong.cn` as live candidate panel hosts and the same
+`campusNetwork` endpoint). `subscription.py` converts all share-link protocols
+bundled in 1.45.1 (`ss`, `trojan`, `anytls`, `vless`, `vmess`, `hysteria2`/`hy2`,
+and `tuic`) to mihomo YAML, preserving SS2022's two identity keys, TLS names and
+pins, QUIC/obfuscation options, and WebSocket/gRPC settings. The existing
+address-map step resolves the client aliases. An invalid or unsupported URI fails
+the refresh before publication. Legacy Clash YAML remains supported.
+
+On 2026-11-25 deploying onto a new Linux host exposed two independent cold-start
+failures:
+1. **Restrictive host `umask` (`0007`/`0027`):** `git clone` checked out files as
+   `0660`, which `COPY` preserved as `root:root 0660` inside `refresher/Dockerfile`.
+   `USER refresher` (`10001:10001`) failed immediately with `Permission denied` on
+   `/app/refresh.py` (`ExitCode 2`, reported by Compose in ~1.3 s as `container
+   proxy_refresher is unhealthy`), and bind-mounted `mihomo/config.yaml` had the
+   same risk for `proxy_service` (`10000:10000`). Explicit `--chmod` on `COPY` in
+   `refresher/Dockerfile` and `chmod a+r mihomo/config.yaml` in `Makefile` make
+   builds and bind mounts independent of the host's `umask`.
+2. **New `vmess://` node in the live native feed:** The account grew from 35 to 39
+   nodes and added a `vmess://` WebSocket entry at URI 30 (`美国01-×0.5`).
+   Deployments with a pre-existing `proxy_nodes` volume stayed `healthy` on stale
+   `nodes.yaml` while failing every refresh in the background, whereas an empty
+   volume never created `/providers/nodes.yaml`. Adding `vmess`, `hysteria2`/`hy2`,
+   and `tuic` URI decoding, `start_interval: 3s` on the refresher healthcheck, and
+   automatic `order_process` network creation in `make up` makes cold-start
+   deployments onto new hosts succeed cleanly.
 
 All 35 profiles loaded in an isolated mihomo v1.19.30 instance. Live HTTPS checks
 passed for 21, failed twice for 13, and completed HTTPS with unavailable egress
@@ -553,3 +576,4 @@ current code reports as `UNEXPECTED_EOF_WHILE_READING`.
 | 2026-09-07 | — | A single-node country that died mid-window kept the selector until the next switch (§6, "Leaving a dead country mid-window"). The rotator's window sleep became a 15 s watch that leaves a dead country at once; "dead" excludes nodes still awaiting their first check, so a node-list reload does not trip it. | `watch()`, `WATCH_SECONDS` and `Country.untested` / `is_dead` in `refresher/rotate.py`. |
 | 2026-10-28 | wmsxwd 1.42.5 | Client-only server aliases failed public DNS because the headless refresher omitted the app's separate encrypted address map (§4). | The refresher decodes and validates that map each cycle, preserves TLS names, and publishes the same selected nodes with current connection addresses. |
 | 2026-11-19 | wmsxwd 1.45.1 | The generic Clash request omitted six account nodes. | Use the packaged user agent without a format flag and decode the complete native URI feed (§4). |
+| 2026-11-25 | wmsxwd 1.45.1 | Deploying onto a `umask 0007` Linux host failed with `Permission denied` on `0660` copied scripts in `refresher/Dockerfile`, and the 39-node live native feed added `vmess://` (`美国01-×0.5` at URI 30), blocking empty-volume publication. Inspected 1.45.1 `.deb`/`.rpm` (`c.dat`, `v3451.json`, `libapp.so`, `AtlasCore_amd64`). | Added explicit `--chmod` in `refresher/Dockerfile` and `chmod a+r` on `mihomo/config.yaml`, `vmess://` / `hysteria2://`(`hy2://`) / `tuic://` decoding in `refresher/subscription.py`, `start_interval: 3s` on the refresher healthcheck, and `order_process` bootstrap in `Makefile`. |

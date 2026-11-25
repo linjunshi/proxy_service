@@ -215,7 +215,13 @@ class DialectTest(unittest.TestCase):
 
 class NativeFeedTest(unittest.TestCase):
     def test_complete_native_feed_reaches_the_published_provider(self):
-        names = ["台湾01-×0.3", "日本01-×1-客户端", "美国05-×1-客户端", "协议测试节点"]
+        names = ["台湾01-×0.3", "日本01-×1-客户端", "美国05-×1-客户端", "协议测试节点", "美国01-×0.5"]
+        vmess_line = b"vmess://" + base64.b64encode(json.dumps({
+            "v": "2", "ps": "美国01-×0.5", "add": "vmess.example.invalid", "port": "18882",
+            "id": "00000000-0000-4000-8000-000000000002", "aid": "0", "scy": "auto",
+            "net": "ws", "type": "none", "host": None, "path": None, "tls": "", "fp": "chrome",
+        }, ensure_ascii=False).encode("utf-8"))
+        native_feed = body("subscription-wms-1.45.1.txt") + b"\n" + vmess_line
         with tempfile.TemporaryDirectory() as directory, mock.patch.dict(os.environ, {
             "PANEL_BASE_URL": "https://panel.example.invalid",
             "PANEL_EMAIL": "me@example.invalid", "PANEL_PASSWORD": "test-password",
@@ -225,21 +231,22 @@ class NativeFeedTest(unittest.TestCase):
             responses = [
                 b'{"data":{"auth_data":"account-token"}}',
                 b'{"data":{"subscribe_url":"https://sub.example.invalid/w/wm?token=user&flag=clash.meta"}}',
-                base64.b64encode(body("subscription-wms-1.45.1.txt")),
+                base64.b64encode(native_feed),
                 json.dumps([{"domain": "wm1jp.000.com", "ip": "192.0.2.1"},
                             {"domain": "us.example.invalid", "ip": "192.0.2.2"}]).encode(),
             ]
             with mock.patch.object(refresh, "_get", side_effect=responses) as request:
-                self.assertEqual(refresh.refresh(settings), 4)
+                self.assertEqual(refresh.refresh(settings), 5)
             download = request.call_args_list[2]
             self.assertEqual(download.args, ("https://sub.example.invalid/w/wm?token=user",))
             self.assertEqual(download.kwargs["headers"], {"User-Agent": "wmsxwd142"})
             nodes = yaml.safe_load(settings.nodes_path.read_bytes())["proxies"]
             self.assertEqual([n["name"] for n in nodes], names)
-            self.assertEqual([n["type"] for n in nodes], ["trojan", "ss", "anytls", "vless"])
+            self.assertEqual([n["type"] for n in nodes], ["trojan", "ss", "anytls", "vless", "vmess"])
             self.assertEqual(nodes[1]["server"], "192.0.2.1")
             self.assertEqual(nodes[1]["password"], "AAECAwQFBgcICQoLDA0ODw==:EBESExQVFhcYGRobHB0eHw==")
             self.assertEqual(nodes[2]["sni"], "tls.example.invalid")
+            self.assertEqual(nodes[4]["ws-opts"], {"path": "/"})
 
     def test_unsupported_native_entry_keeps_the_previous_provider(self):
         document = body("subscription-wms-1.45.1.txt") + b"\nnewprotocol://SECRET@host:443#new"
