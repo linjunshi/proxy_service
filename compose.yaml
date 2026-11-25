@@ -6,6 +6,7 @@ services:
   proxy_service:
     image: metacubex/mihomo:v1.19.30@sha256:baf38d282b785d7037337676714a69e3fdd1f2d9bf748dfd25fce681a624ea74
     container_name: proxy_service
+    env_file: [.env]
     restart: unless-stopped
     # mihomo fails to start when a provider's file is missing, so at first boot the
     # node list must exist before the core does. On a later host reboot the list is
@@ -80,6 +81,7 @@ services:
     build: ./refresher
     command: ["/app/rotate.py"]
     container_name: proxy_rotator
+    env_file: [.env]
     restart: unless-stopped
     # The core's control API is bound to 127.0.0.1 inside the core's own container.
     # Sharing its network namespace is what reaches it without exposing 9090 to
